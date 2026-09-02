@@ -24,6 +24,7 @@ mod positional_deletes;
 mod predicate_plan;
 pub(super) mod predicate_visitor;
 mod projection;
+mod read_projection;
 mod row_filter;
 mod row_lineage;
 mod row_positions;
@@ -31,6 +32,8 @@ mod selected_rows;
 
 #[cfg(test)]
 mod encryption_tests;
+#[cfg(test)]
+mod zero_projection_tests;
 
 pub use file_reader::ArrowFileReader;
 pub(crate) use options::ParquetReadOptions;

@@ -27,11 +27,12 @@ use arrow_schema::{DataType, Field, FieldRef};
 use parquet::arrow::arrow_reader::{
     ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder,
 };
-use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask, RowNumber};
+use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, RowNumber};
 use parquet::encryption::decrypt::FileDecryptionProperties;
 use parquet::file::metadata::{PageIndexPolicy, ParquetMetaDataReader};
 
 use super::predicate_plan::FilePredicatePlan;
+use super::read_projection::ReadProjectionPlan;
 use super::row_filter::TransformedRecordBatchFilter;
 use super::row_lineage::RowLineageResolution;
 use super::row_positions::RowPositionsSelection;
@@ -54,7 +55,6 @@ use crate::metadata_columns::{
     RESERVED_COL_NAME_POS, RESERVED_FIELD_ID_FILE,
     RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER, RESERVED_FIELD_ID_PARTITION,
     RESERVED_FIELD_ID_POS, RESERVED_FIELD_ID_ROW_ID, RESERVED_FIELD_ID_SPEC_ID,
-    is_metadata_field,
 };
 use crate::scan::{ArrowRecordBatchIterator, FileScanTask};
 use crate::spec::{Datum, NameMapping, PartitionSpec, SchemaRef, Struct, StructType};
@@ -504,18 +504,19 @@ impl ArrowReader {
         };
 
         let predicate_plan = FilePredicatePlan::try_new(final_predicate)?;
-        let requested_project_field_ids = plan.project_field_ids.to_vec();
-        let post_transform_field_ids = predicate_plan.post_transform_field_ids();
-        let needs_position_column = requested_project_field_ids
-            .contains(&RESERVED_FIELD_ID_POS)
-            || post_transform_field_ids.contains(&RESERVED_FIELD_ID_POS);
-        let needs_row_id_column = requested_project_field_ids
-            .contains(&RESERVED_FIELD_ID_ROW_ID)
-            || post_transform_field_ids.contains(&RESERVED_FIELD_ID_ROW_ID);
-        let needs_last_updated_column = requested_project_field_ids
-            .contains(&RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER)
-            || post_transform_field_ids
-                .contains(&RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER);
+        let projection_plan = ReadProjectionPlan::new(
+            plan.project_field_ids,
+            predicate_plan.post_transform_field_ids(),
+        );
+        let needs_position_column = projection_plan
+            .reader_field_ids()
+            .contains(&RESERVED_FIELD_ID_POS);
+        let needs_row_id_column = projection_plan
+            .reader_field_ids()
+            .contains(&RESERVED_FIELD_ID_ROW_ID);
+        let needs_last_updated_column = projection_plan
+            .reader_field_ids()
+            .contains(&RESERVED_FIELD_ID_LAST_UPDATED_SEQUENCE_NUMBER);
         // A pre-v3 file carried into a v3 table can still have no effective
         // row-id range. Preserve that state as NULL; the snapshot/manifest
         // writer that first commits it in v3 assigns the inherited range.
@@ -536,20 +537,11 @@ impl ArrowReader {
             None
         };
         let needs_row_number_column = needs_position_column || inherit_row_id;
-        let mut effective_project_field_ids = requested_project_field_ids.clone();
-        let mut ordered_post_transform_field_ids =
-            post_transform_field_ids.iter().copied().collect::<Vec<_>>();
-        ordered_post_transform_field_ids.sort_unstable();
-        for field_id in ordered_post_transform_field_ids {
-            if !effective_project_field_ids.contains(&field_id) {
-                effective_project_field_ids.push(field_id);
-            }
-        }
-        if inherit_row_id
-            && !effective_project_field_ids.contains(&RESERVED_FIELD_ID_POS)
-        {
-            effective_project_field_ids.push(RESERVED_FIELD_ID_POS);
-        }
+        let projection_plan = if inherit_row_id {
+            projection_plan.with_internal_field(RESERVED_FIELD_ID_POS)
+        } else {
+            projection_plan
+        };
         let first_row_id = plan.first_row_id;
 
         let arrow_metadata = if needs_row_number_column {
@@ -564,22 +556,12 @@ impl ArrowReader {
                 arrow_metadata,
             );
 
-        // Filter out all metadata fields for ordinary Parquet projection. The
-        // virtual `_pos` column and physically stored lineage leaves are added
-        // separately below because they are not in the table schema.
-        let project_field_ids_without_metadata: Vec<i32> =
-            effective_project_field_ids
-                .iter()
-                .filter(|&&id| !is_metadata_field(id))
-                .copied()
-                .collect();
-
         // Create projection mask based on field IDs
         // - If file has embedded IDs: field-ID-based projection.
         // - If name mapping applied: field-ID-based projection using mapped IDs.
         // - Otherwise: position-based fallback projection.
         let mut projection_mask = Self::get_arrow_projection_mask(
-            &project_field_ids_without_metadata,
+            projection_plan.physical_data_field_ids(),
             plan.schema,
             record_batch_reader_builder.parquet_schema(),
             record_batch_reader_builder.schema(),
@@ -603,18 +585,6 @@ impl ArrowReader {
                 None
             };
 
-        // A metadata-only projection normally maps to "read all" so a bare
-        // COUNT(*) still has a row source. `_pos` and a physically stored
-        // lineage column provide that row source independently, so avoid
-        // reading the data columns in those projections.
-        if project_field_ids_without_metadata.is_empty()
-            && (needs_row_number_column || physical_lineage_projection_mask.is_some())
-        {
-            projection_mask = ProjectionMask::none(
-                record_batch_reader_builder.parquet_schema().num_columns(),
-            );
-        }
-
         if let Some(physical_lineage_projection_mask) =
             physical_lineage_projection_mask
         {
@@ -629,17 +599,23 @@ impl ArrowReader {
         // column re-ordering, partition constants, and virtual field addition (like _file)
         let mut record_batch_transformer_builder = RecordBatchTransformerBuilder::new(
             Arc::clone(plan.schema),
-            &effective_project_field_ids,
+            projection_plan.reader_field_ids(),
         );
 
         // Add the _file metadata column if it's in the projected fields
-        if effective_project_field_ids.contains(&RESERVED_FIELD_ID_FILE) {
+        if projection_plan
+            .reader_field_ids()
+            .contains(&RESERVED_FIELD_ID_FILE)
+        {
             let file_datum = Datum::string(plan.data_file_path.to_owned());
             record_batch_transformer_builder = record_batch_transformer_builder
                 .with_constant(RESERVED_FIELD_ID_FILE, file_datum);
         }
 
-        if effective_project_field_ids.contains(&RESERVED_FIELD_ID_SPEC_ID) {
+        if projection_plan
+            .reader_field_ids()
+            .contains(&RESERVED_FIELD_ID_SPEC_ID)
+        {
             record_batch_transformer_builder = record_batch_transformer_builder
                 .with_constant(
                     RESERVED_FIELD_ID_SPEC_ID,
@@ -647,7 +623,10 @@ impl ArrowReader {
                 );
         }
 
-        if effective_project_field_ids.contains(&RESERVED_FIELD_ID_PARTITION) {
+        if projection_plan
+            .reader_field_ids()
+            .contains(&RESERVED_FIELD_ID_PARTITION)
+        {
             let unified_type = plan.unified_partition_type.ok_or_else(|| {
                 Error::new(
                     ErrorKind::Unexpected,
@@ -880,7 +859,8 @@ impl ArrowReader {
             .into_post_transform_residual()
             .map(TransformedRecordBatchFilter::new);
         let should_prune_internal_projection =
-            effective_project_field_ids != requested_project_field_ids;
+            projection_plan.requires_output_pruning();
+        let requested_project_field_ids = projection_plan.into_requested_field_ids();
 
         // Build the batch stream and send all the RecordBatches that it generates
         // to the requester.

@@ -492,6 +492,27 @@ mod tests {
             key_metadata: None,
         }];
 
+        let mut zero_projection_tasks = tasks.clone();
+        zero_projection_tasks[0].project_field_ids.clear();
+        let zero_projection_result = reader
+            .clone()
+            .read(zero_projection_tasks)
+            .unwrap()
+            .collect::<Result<Vec<RecordBatch>, _>>()
+            .unwrap();
+        assert!(
+            zero_projection_result
+                .iter()
+                .all(|batch| batch.num_columns() == 0)
+        );
+        assert_eq!(
+            zero_projection_result
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            199
+        );
+
         let result = reader
             .read(tasks)
             .unwrap()

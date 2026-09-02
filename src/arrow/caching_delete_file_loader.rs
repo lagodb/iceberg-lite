@@ -639,6 +639,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::arrow::ArrowReaderBuilder;
     use crate::arrow::delete_filter::tests::setup;
     use crate::scan::FileScanTaskDeleteFile;
     use crate::spec::{DataContentType, Schema};
@@ -1012,6 +1013,25 @@ mod tests {
                 .unwrap(),
         );
 
+        let data_file_path =
+            format!("{}/data-1.parquet", table_location.to_str().unwrap());
+        let data_batch = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![
+                simple_field("y", DataType::Int64, true, "2"),
+                simple_field("z", DataType::Int64, true, "3"),
+            ])),
+            vec![
+                Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3)])),
+                Arc::new(Int64Array::from(vec![Some(100), None, Some(300)])),
+            ],
+        )
+        .unwrap();
+        let data_file = File::create(&data_file_path).unwrap();
+        let mut data_writer =
+            ArrowWriter::try_new(data_file, data_batch.schema(), None).unwrap();
+        data_writer.write(&data_batch).unwrap();
+        data_writer.close().unwrap();
+
         // Write positional delete file
         let positional_delete_schema =
             crate::arrow::delete_filter::tests::create_pos_del_schema();
@@ -1076,23 +1096,20 @@ mod tests {
             key_metadata: None,
         };
 
-        let file_scan_task = FileScanTask {
+        let equality_only_task = FileScanTask {
             file_size_in_bytes: 0,
             start: 0,
             length: 0,
             record_count: None,
             first_row_id: None,
             data_sequence_number: None,
-            data_file_path: format!(
-                "{}/data-1.parquet",
-                table_location.to_str().unwrap()
-            ),
+            data_file_path: data_file_path.clone(),
             data_file_format: DataFileFormat::Parquet,
             partition_spec_id: 0,
             schema: data_file_schema.clone(),
-            project_field_ids: vec![2, 3],
+            project_field_ids: vec![],
             predicate: None,
-            deletes: vec![pos_del, eq_del],
+            deletes: vec![eq_del.clone()],
             partition: None,
             partition_spec: None,
             unified_partition_type: None,
@@ -1100,6 +1117,10 @@ mod tests {
             case_sensitive: false,
             key_metadata: None,
         };
+
+        let mut file_scan_task = equality_only_task.clone();
+        file_scan_task.project_field_ids = vec![2, 3];
+        file_scan_task.deletes = vec![pos_del, eq_del];
 
         // Load the deletes - should handle both types without error
         let delete_file_loader = CachingDeleteFileLoader::new(file_io.clone(), 10);
@@ -1114,6 +1135,15 @@ mod tests {
             "Failed to build equality delete predicate: {:?}",
             result.err()
         );
+
+        let batches = ArrowReaderBuilder::new(file_io)
+            .build()
+            .read(vec![equality_only_task])
+            .unwrap()
+            .collect::<Result<Vec<_>>>()
+            .unwrap();
+        assert!(batches.iter().all(|batch| batch.num_columns() == 0));
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 `iceberg-lite` is a lightweight, synchronous Rust implementation of the [Apache Iceberg](https://iceberg.apache.org/) table format. It is derived from [Apache Iceberg Rust (iceberg-rust)](https://github.com/apache/iceberg-rust) and purpose-built for relational database engines, embedded analytical runtimes, and storage layers that require a deterministic, synchronous execution model.
 
-Originally engineered as the core table format engine for LagoDB, `iceberg-lite` is maintained as an independent, standalone library alongside [lagodb-storage](https://github.com/lagodb/lagodb-storage).
+Originally engineered as the core table format engine for [LagoDB](https://github.com/lagodb/lagodb), `iceberg-lite` is maintained as an independent, standalone library.
 
 ---
 

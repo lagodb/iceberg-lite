@@ -709,6 +709,36 @@ impl TableScan {
         tasks: Arc<[FileScanTask]>,
         filter: Option<Predicate>,
     ) -> Result<ArrowRecordBatchIterator> {
+        self.to_arrow_with_shared_tasks_filter_and_batch_size(
+            tasks,
+            filter,
+            self.batch_size,
+        )
+    }
+
+    /// Read shared pre-planned tasks with a generation-specific batch size.
+    ///
+    /// This keeps task/delete planning immutable while allowing a query engine
+    /// to apply its per-stream batch contract when it opens a new generation.
+    pub fn to_arrow_with_shared_tasks_and_filter_and_batch_size(
+        &self,
+        tasks: Arc<[FileScanTask]>,
+        filter: Option<Predicate>,
+        batch_size: usize,
+    ) -> Result<ArrowRecordBatchIterator> {
+        self.to_arrow_with_shared_tasks_filter_and_batch_size(
+            tasks,
+            filter,
+            Some(batch_size),
+        )
+    }
+
+    fn to_arrow_with_shared_tasks_filter_and_batch_size(
+        &self,
+        tasks: Arc<[FileScanTask]>,
+        filter: Option<Predicate>,
+        batch_size: Option<usize>,
+    ) -> Result<ArrowRecordBatchIterator> {
         let bound_filter = match (filter, self.plan_context.as_ref()) {
             (Some(filter), Some(plan_context)) => Some(
                 filter
@@ -723,7 +753,7 @@ impl TableScan {
             .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
             .with_row_selection_enabled(self.row_selection_enabled);
 
-        if let Some(batch_size) = self.batch_size {
+        if let Some(batch_size) = batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
         }
 

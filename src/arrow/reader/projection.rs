@@ -123,8 +123,12 @@ impl ArrowReader {
             }
         }
 
+        // `ScanProjection::All` is expanded to concrete field IDs before a
+        // FileScanTask is created. An empty task projection therefore means
+        // that the caller requested no data columns. parquet-rs preserves the
+        // selected row count through its EmptyArrayReader for this mask.
         if field_ids.is_empty() {
-            return Ok(ProjectionMask::all());
+            return Ok(ProjectionMask::none(parquet_schema.num_columns()));
         }
 
         // Reading variant columns is not supported yet (see #2188 follow-ups): reject any
@@ -514,6 +518,28 @@ mod tests {
         DataFileFormat, Datum, MappedField, NameMapping, NestedField, PrimitiveType,
         Schema, Type,
     };
+
+    #[test]
+    fn empty_field_ids_project_no_parquet_columns() {
+        let parquet_type = parse_message_type(
+            "message schema { required int64 a; optional binary b (STRING); }",
+        )
+        .unwrap();
+        let parquet_schema = SchemaDescriptor::new(Arc::new(parquet_type));
+        let iceberg_schema = Schema::builder().build().unwrap();
+        let arrow_schema = Arc::new(ArrowSchema::empty());
+
+        let mask = ArrowReader::get_arrow_projection_mask(
+            &[],
+            &iceberg_schema,
+            &parquet_schema,
+            &arrow_schema,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(mask, ProjectionMask::none(2));
+    }
 
     #[test]
     fn test_arrow_projection_mask() {
