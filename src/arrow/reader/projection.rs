@@ -260,8 +260,8 @@ impl ArrowReader {
 
         if indices.is_empty() {
             // Edge case: All requested columns are new (don't exist in file).
-            // Project all columns so RecordBatchTransformer has a batch to transform.
-            Ok(ProjectionMask::all())
+            // parquet-rs' EmptyArrayReader preserves the selected row count.
+            Ok(ProjectionMask::none(parquet_schema.num_columns()))
         } else {
             Ok(ProjectionMask::leaves(parquet_schema, indices))
         }
@@ -288,7 +288,7 @@ impl ArrowReader {
         }
 
         if root_indices.is_empty() {
-            Ok(ProjectionMask::all())
+            Ok(ProjectionMask::none(parquet_schema.num_columns()))
         } else {
             Ok(ProjectionMask::roots(parquet_schema, root_indices))
         }

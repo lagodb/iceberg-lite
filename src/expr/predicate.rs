@@ -757,6 +757,17 @@ pub enum BoundPredicate {
 }
 
 impl BoundPredicate {
+    /// Clone a conjunction while preserving the root constant folding already
+    /// performed by [`Predicate::and`] before ordinary predicate binding.
+    pub(crate) fn cloned_and(&self, other: &Self) -> Self {
+        match (self, other) {
+            (Self::AlwaysFalse, _) | (_, Self::AlwaysFalse) => Self::AlwaysFalse,
+            (Self::AlwaysTrue, rhs) => rhs.clone(),
+            (lhs, Self::AlwaysTrue) => lhs.clone(),
+            (lhs, rhs) => lhs.clone().and(rhs.clone()),
+        }
+    }
+
     pub(crate) fn and(self, other: BoundPredicate) -> BoundPredicate {
         BoundPredicate::And(LogicalExpression::new([Box::new(self), Box::new(other)]))
     }

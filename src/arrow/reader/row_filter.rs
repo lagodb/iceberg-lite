@@ -69,7 +69,7 @@ impl TransformedRecordBatchFilter {
                 "transformed record batch predicate was not initialized",
             ));
         };
-        let filter = predicate_fn(batch.clone()).map_err(|err| {
+        let filter = predicate_fn(&batch).map_err(|err| {
             Error::new(
                 ErrorKind::Unexpected,
                 "failed to evaluate predicate against transformed record batch",
@@ -113,8 +113,10 @@ impl ArrowReader {
         // creates the projection mask for the Arrow predicates.
         let projection_mask =
             ProjectionMask::leaves(parquet_schema, column_indices.clone());
-        let predicate_func = visit(&mut converter, predicates)?;
-        let arrow_predicate = ArrowPredicateFn::new(projection_mask, predicate_func);
+        let mut predicate_func = visit(&mut converter, predicates)?;
+        let arrow_predicate = ArrowPredicateFn::new(projection_mask, move |batch| {
+            predicate_func(&batch)
+        });
         Ok(RowFilter::new(vec![Box::new(arrow_predicate)]))
     }
 

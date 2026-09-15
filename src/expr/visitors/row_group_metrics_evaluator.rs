@@ -144,6 +144,7 @@ impl<'a> RowGroupMetricsEvaluator<'a> {
         };
 
         get_parquet_stat_min_as_datum(&primitive_type, stats)
+            .map(|bound| bound.filter(|datum| !datum.is_nan()))
     }
 
     fn max_value(&self, field_id: i32) -> Result<Option<Datum>> {
@@ -154,6 +155,7 @@ impl<'a> RowGroupMetricsEvaluator<'a> {
         };
 
         get_parquet_stat_max_as_datum(&primitive_type, stats)
+            .map(|bound| bound.filter(|datum| !datum.is_nan()))
     }
 
     fn visit_inequality(
@@ -310,24 +312,16 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
             return ROW_GROUP_CANT_MATCH;
         }
 
-        if let Some(lower_bound) = self.min_value(field_id)? {
-            if lower_bound.is_nan() {
-                // NaN indicates unreliable bounds.
-                // See the InclusiveMetricsEvaluator docs for more.
-                return ROW_GROUP_MIGHT_MATCH;
-            } else if lower_bound.gt(datum) {
-                return ROW_GROUP_CANT_MATCH;
-            }
+        if let Some(lower_bound) = self.min_value(field_id)?
+            && lower_bound.gt(datum)
+        {
+            return ROW_GROUP_CANT_MATCH;
         }
 
-        if let Some(upper_bound) = self.max_value(field_id)? {
-            if upper_bound.is_nan() {
-                // NaN indicates unreliable bounds.
-                // See the InclusiveMetricsEvaluator docs for more.
-                return ROW_GROUP_MIGHT_MATCH;
-            } else if upper_bound.lt(datum) {
-                return ROW_GROUP_CANT_MATCH;
-            }
+        if let Some(upper_bound) = self.max_value(field_id)?
+            && upper_bound.lt(datum)
+        {
+            return ROW_GROUP_CANT_MATCH;
         }
 
         ROW_GROUP_MIGHT_MATCH
@@ -493,28 +487,18 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
             return ROW_GROUP_MIGHT_MATCH;
         }
 
-        if let Some(lower_bound) = self.min_value(field_id)? {
-            if lower_bound.is_nan() {
-                // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
-                return ROW_GROUP_MIGHT_MATCH;
-            }
-
-            if !literals.iter().any(|datum| datum.ge(&lower_bound)) {
-                // if all values are less than lower bound, rows cannot match.
-                return ROW_GROUP_CANT_MATCH;
-            }
+        if let Some(lower_bound) = self.min_value(field_id)?
+            && !literals.iter().any(|datum| datum.ge(&lower_bound))
+        {
+            // if all values are less than lower bound, rows cannot match.
+            return ROW_GROUP_CANT_MATCH;
         }
 
-        if let Some(upper_bound) = self.max_value(field_id)? {
-            if upper_bound.is_nan() {
-                // NaN indicates unreliable bounds. See the InclusiveMetricsEvaluator docs for more.
-                return ROW_GROUP_MIGHT_MATCH;
-            }
-
-            if !literals.iter().any(|datum| datum.le(&upper_bound)) {
-                // if all values are greater than upper bound, rows cannot match.
-                return ROW_GROUP_CANT_MATCH;
-            }
+        if let Some(upper_bound) = self.max_value(field_id)?
+            && !literals.iter().any(|datum| datum.le(&upper_bound))
+        {
+            // if all values are greater than upper bound, rows cannot match.
+            return ROW_GROUP_CANT_MATCH;
         }
 
         ROW_GROUP_MIGHT_MATCH
@@ -1741,9 +1725,8 @@ mod tests {
     }
 
     #[test]
-    fn eval_true_for_lower_bound_is_nan_filter_is_in() -> Result<()> {
-        // TODO: should this be false, since the max stat
-        //       is lower than the min val in the set?
+    fn eval_false_for_lower_bound_is_nan_but_upper_bound_excludes_is_in() -> Result<()>
+    {
         let row_group_metadata = create_row_group_metadata(
             1,
             1,
@@ -1772,7 +1755,7 @@ mod tests {
             iceberg_schema_ref.as_ref(),
         )?;
 
-        assert!(result);
+        assert!(!result);
         Ok(())
     }
 

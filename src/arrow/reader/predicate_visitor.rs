@@ -366,7 +366,7 @@ fn compute_is_nan(array: &ArrayRef) -> std::result::Result<BooleanArray, ArrowEr
     Ok(BooleanArray::new(values, None))
 }
 
-pub(super) type PredicateResult = dyn FnMut(RecordBatch) -> std::result::Result<BooleanArray, ArrowError>
+pub(super) type PredicateResult = dyn FnMut(&RecordBatch) -> std::result::Result<BooleanArray, ArrowError>
     + Send
     + 'static;
 
@@ -387,7 +387,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         mut rhs: Box<PredicateResult>,
     ) -> Result<Box<PredicateResult>> {
         Ok(Box::new(move |batch| {
-            let left = lhs(batch.clone())?;
+            let left = lhs(batch)?;
             let right = rhs(batch)?;
             and_kleene(&left, &right)
         }))
@@ -399,7 +399,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
         mut rhs: Box<PredicateResult>,
     ) -> Result<Box<PredicateResult>> {
         Ok(Box::new(move |batch| {
-            let left = lhs(batch.clone())?;
+            let left = lhs(batch)?;
             let right = rhs(batch)?;
             or_kleene(&left, &right)
         }))
@@ -422,7 +422,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
             Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
+                let column = project_column(batch, idx)?;
                 is_null(&column)
             }))
         } else {
@@ -438,7 +438,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
             Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
+                let column = project_column(batch, idx)?;
                 is_not_null(&column)
             }))
         } else {
@@ -454,7 +454,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
             Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
+                let column = project_column(batch, idx)?;
                 compute_is_nan(&column)
             }))
         } else {
@@ -470,7 +470,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
     ) -> Result<Box<PredicateResult>> {
         if let Some(idx) = self.bound_reference(reference)? {
             Ok(Box::new(move |batch| {
-                let column = project_column(&batch, idx)?;
+                let column = project_column(batch, idx)?;
                 let is_nan = compute_is_nan(&column)?;
                 not(&is_nan)
             }))
@@ -490,7 +490,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 lt(&left, literal.as_ref())
             }))
@@ -510,7 +510,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 lt_eq(&left, literal.as_ref())
             }))
@@ -530,7 +530,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 gt(&left, literal.as_ref())
             }))
@@ -550,7 +550,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 gt_eq(&left, literal.as_ref())
             }))
@@ -570,7 +570,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 eq(&left, literal.as_ref())
             }))
@@ -590,7 +590,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 neq(&left, literal.as_ref())
             }))
@@ -610,7 +610,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 starts_with(&left, literal.as_ref())
             }))
@@ -630,7 +630,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             let literal = get_arrow_datum(literal)?;
 
             Ok(Box::new(move |batch| {
-                let left = project_column(&batch, idx)?;
+                let left = project_column(batch, idx)?;
                 let literal = try_cast_literal(&literal, left.data_type())?;
                 // update here if arrow ever adds a native not_starts_with
                 not(&starts_with(&left, literal.as_ref())?)
@@ -655,7 +655,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native is_in kernel
-                let left = project_column(&batch, idx)?;
+                let left = project_column(batch, idx)?;
 
                 let mut acc = BooleanArray::from(vec![false; batch.num_rows()]);
                 for literal in &literals {
@@ -685,7 +685,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
 
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native not_in kernel
-                let left = project_column(&batch, idx)?;
+                let left = project_column(batch, idx)?;
                 let mut acc = BooleanArray::from(vec![true; batch.num_rows()]);
                 for literal in &literals {
                     let literal = try_cast_literal(literal, left.data_type())?;
@@ -853,7 +853,7 @@ mod tests {
             &column_indices,
         );
         let mut predicate_fn = visit(&mut converter, &bound).unwrap();
-        predicate_fn(batch).unwrap()
+        predicate_fn(&batch).unwrap()
     }
 
     #[test]

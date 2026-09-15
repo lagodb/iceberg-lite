@@ -331,13 +331,13 @@ impl<'a> PageIndexEvaluator<'a> {
                 .zip(row_counts.iter())
                 .map(|((i, (min, max)), &row_count)| {
                     predicate(
-                        min.map(|&val| {
+                        min.filter(|val| !val.is_nan()).map(|&val| {
                             Datum::new(
                                 field_type.clone(),
                                 PrimitiveLiteral::Float(OrderedFloat::from(val)),
                             )
                         }),
-                        max.map(|&val| {
+                        max.filter(|val| !val.is_nan()).map(|&val| {
                             Datum::new(
                                 field_type.clone(),
                                 PrimitiveLiteral::Float(OrderedFloat::from(val)),
@@ -357,13 +357,13 @@ impl<'a> PageIndexEvaluator<'a> {
                 .zip(row_counts.iter())
                 .map(|((i, (min, max)), &row_count)| {
                     predicate(
-                        min.map(|&val| {
+                        min.filter(|val| !val.is_nan()).map(|&val| {
                             Datum::new(
                                 field_type.clone(),
                                 PrimitiveLiteral::Double(OrderedFloat::from(val)),
                             )
                         }),
-                        max.map(|&val| {
+                        max.filter(|val| !val.is_nan()).map(|&val| {
                             Datum::new(
                                 field_type.clone(),
                                 PrimitiveLiteral::Double(OrderedFloat::from(val)),

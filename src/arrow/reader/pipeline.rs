@@ -36,6 +36,7 @@ use super::read_projection::ReadProjectionPlan;
 use super::row_filter::TransformedRecordBatchFilter;
 use super::row_lineage::RowLineageResolution;
 use super::row_positions::RowPositionsSelection;
+use super::shared_task_reader::FileScanTaskReader;
 use super::{
     ArrowFileReader, ArrowReader, ParquetReadOptions, SelectedRowsReadRequest,
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
@@ -64,7 +65,7 @@ use crate::{Error, ErrorKind};
 /// handling is complete. Keeping the scan variant inline avoids one heap
 /// allocation per data file.
 #[allow(clippy::large_enum_variant)]
-enum FileReadRequest {
+pub(super) enum FileReadRequest {
     Scan {
         task: FileScanTask,
         validate_record_count: bool,
@@ -72,7 +73,8 @@ enum FileReadRequest {
     SharedScan {
         tasks: Arc<[FileScanTask]>,
         task_index: usize,
-        predicate: Option<Arc<BoundPredicate>>,
+        base_predicate: Option<Arc<BoundPredicate>>,
+        supplemental_predicate: Option<Arc<BoundPredicate>>,
     },
     SelectedRows(Box<SelectedRowsReadRequest>),
 }
@@ -91,7 +93,8 @@ struct FileReadPlan<'a> {
     key_metadata: Option<&'a [u8]>,
     schema: &'a SchemaRef,
     project_field_ids: &'a [i32],
-    predicate: Option<&'a BoundPredicate>,
+    base_predicate: Option<&'a BoundPredicate>,
+    supplemental_predicate: Option<&'a BoundPredicate>,
     partition: Option<&'a Struct>,
     partition_spec: Option<&'a Arc<PartitionSpec>>,
     unified_partition_type: Option<&'a Arc<StructType>>,
@@ -146,7 +149,8 @@ impl FileReadRequest {
                     key_metadata: task.key_metadata.as_deref(),
                     schema: &task.schema,
                     project_field_ids: &task.project_field_ids,
-                    predicate: task.predicate.as_ref(),
+                    base_predicate: task.predicate.as_ref(),
+                    supplemental_predicate: None,
                     partition: task.partition.as_ref(),
                     partition_spec: task.partition_spec.as_ref(),
                     unified_partition_type: task.unified_partition_type.as_ref(),
@@ -160,7 +164,8 @@ impl FileReadRequest {
             Self::SharedScan {
                 tasks,
                 task_index,
-                predicate,
+                base_predicate,
+                supplemental_predicate,
             } => {
                 let task = tasks.get(*task_index).ok_or_else(|| {
                     Error::new(
@@ -180,7 +185,8 @@ impl FileReadRequest {
                     key_metadata: task.key_metadata.as_deref(),
                     schema: &task.schema,
                     project_field_ids: &task.project_field_ids,
-                    predicate: predicate.as_deref(),
+                    base_predicate: base_predicate.as_deref(),
+                    supplemental_predicate: supplemental_predicate.as_deref(),
                     partition: task.partition.as_ref(),
                     partition_spec: task.partition_spec.as_ref(),
                     unified_partition_type: task.unified_partition_type.as_ref(),
@@ -203,7 +209,8 @@ impl FileReadRequest {
                 key_metadata: request.task.key_metadata.as_deref(),
                 schema: &request.task.schema,
                 project_field_ids: &request.task.project_field_ids,
-                predicate: request.task.predicate.as_ref(),
+                base_predicate: request.task.predicate.as_ref(),
+                supplemental_predicate: None,
                 partition: request.task.partition.as_ref(),
                 partition_spec: request.task.partition_spec.as_ref(),
                 unified_partition_type: request.task.unified_partition_type.as_ref(),
@@ -264,12 +271,13 @@ impl ArrowReader {
         tasks: Arc<[FileScanTask]>,
         predicate: Option<BoundPredicate>,
     ) -> Result<ArrowRecordBatchIterator> {
-        let predicate = predicate.map(Arc::new);
+        let base_predicate = predicate.map(Arc::new);
         let requests =
             (0..tasks.len()).map(move |task_index| FileReadRequest::SharedScan {
                 tasks: Arc::clone(&tasks),
                 task_index,
-                predicate: predicate.clone(),
+                base_predicate: base_predicate.clone(),
+                supplemental_predicate: None,
             });
 
         Ok(self.read_requests_with_metrics(requests)?.stream())
@@ -324,47 +332,30 @@ impl ArrowReader {
         I: IntoIterator<Item = FileReadRequest>,
         I::IntoIter: Send + 'static,
     {
-        let file_io = self.file_io;
-        let batch_size = self.batch_size;
-        let row_group_filtering_enabled = self.row_group_filtering_enabled;
-        let row_selection_enabled = self.row_selection_enabled;
-        let parquet_read_options = self.parquet_read_options;
-        let scan_metrics = ScanMetrics::new();
-        let scan_metrics_for_result = scan_metrics.clone();
-        let delete_file_loader = self
-            .delete_file_loader
-            .with_scan_metrics(scan_metrics.clone());
+        let task_reader = FileScanTaskReader::new(self);
+        let scan_metrics = task_reader.scan_metrics().clone();
 
-        let iterator = requests.into_iter().flat_map(move |request| {
-            let file_io = file_io.clone();
-            let delete_file_loader = delete_file_loader.clone();
-            let scan_metrics = scan_metrics.clone();
-
-            match Self::process_file_read_request(
-                request,
-                batch_size,
-                file_io,
-                delete_file_loader,
-                row_group_filtering_enabled,
-                row_selection_enabled,
-                parquet_read_options,
-                scan_metrics,
-            ) {
-                Ok(iter) => iter,
-                Err(e) => {
-                    let err =
-                        Error::new(ErrorKind::Unexpected, "file read request failed")
-                            .with_source(e);
-                    Box::new(std::iter::once(Err(err))) as ArrowRecordBatchIterator
+        let iterator =
+            requests.into_iter().flat_map(move |request| {
+                match task_reader.read(request) {
+                    Ok(iter) => iter,
+                    Err(e) => {
+                        let err = Error::new(
+                            ErrorKind::Unexpected,
+                            "file read request failed",
+                        )
+                        .with_source(e);
+                        Box::new(std::iter::once(Err(err)))
+                            as ArrowRecordBatchIterator
+                    }
                 }
-            }
-        });
+            });
 
-        Ok(ScanResult::new(Box::new(iterator), scan_metrics_for_result))
+        Ok(ScanResult::new(Box::new(iterator), scan_metrics))
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn process_file_read_request(
+    pub(super) fn process_file_read_request(
         request: FileReadRequest,
         batch_size: Option<usize>,
         file_io: FileIO,
@@ -375,8 +366,10 @@ impl ArrowReader {
         scan_metrics: ScanMetrics,
     ) -> Result<ArrowRecordBatchIterator> {
         let plan = request.plan()?;
+        let has_scan_predicate =
+            plan.base_predicate.is_some() || plan.supplemental_predicate.is_some();
         let predicate_page_pruning = row_selection_enabled
-            && (plan.predicate.is_some() || plan.has_equality_deletes);
+            && (has_scan_predicate || plan.has_equality_deletes);
         let column_index_policy = if predicate_page_pruning {
             PageIndexPolicy::Optional
         } else {
@@ -494,12 +487,23 @@ impl ArrowReader {
         // In addition to the optional predicate supplied in the `FileScanTask`,
         // we also have an optional predicate resulting from equality delete files.
         // If both are present, we logical-AND them together to form a single filter.
-        let final_predicate = match (plan.predicate, delete_predicate) {
+        // A shared scan keeps its stable base and evolving supplemental trees
+        // separately so generation changes never clone or bind the base. This
+        // is the existing per-file ownership boundary where both trees must be
+        // cloned into the predicate plan in either representation.
+        let scan_predicate = match (plan.base_predicate, plan.supplemental_predicate)
+        {
             (None, None) => None,
-            (Some(predicate), None) => Some(predicate.clone()),
-            (None, Some(ref predicate)) => Some(predicate.clone()),
+            (Some(predicate), None) | (None, Some(predicate)) => {
+                Some(predicate.clone())
+            }
+            (Some(base), Some(supplemental)) => Some(base.cloned_and(supplemental)),
+        };
+        let final_predicate = match (scan_predicate, delete_predicate) {
+            (None, None) => None,
+            (Some(predicate), None) | (None, Some(predicate)) => Some(predicate),
             (Some(filter_predicate), Some(delete_predicate)) => {
-                Some(filter_predicate.clone().and(delete_predicate))
+                Some(filter_predicate.and(delete_predicate))
             }
         };
 

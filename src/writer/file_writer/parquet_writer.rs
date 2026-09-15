@@ -17,7 +17,7 @@
 
 //! The module contains the file writer for parquet file format.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef as ArrowSchemaRef;
@@ -332,6 +332,7 @@ pub struct ParquetWriter {
 struct MinMaxColAggregator {
     lower_bounds: HashMap<i32, Datum>,
     upper_bounds: HashMap<i32, Datum>,
+    fields_with_nan_bounds: HashSet<i32>,
     schema: SchemaRef,
 }
 
@@ -341,8 +342,18 @@ impl MinMaxColAggregator {
         Self {
             lower_bounds: HashMap::new(),
             upper_bounds: HashMap::new(),
+            fields_with_nan_bounds: HashSet::new(),
             schema,
         }
+    }
+
+    fn invalidate_bounds(&mut self, field_id: i32) {
+        // Iceberg bounds order only non-null, non-NaN values. When Parquet
+        // supplies NaN as an extremum, conservatively omit both file-level
+        // bounds and prevent later row groups from restoring partial metrics.
+        self.lower_bounds.remove(&field_id);
+        self.upper_bounds.remove(&field_id);
+        self.fields_with_nan_bounds.insert(field_id);
     }
 
     fn update_state_min(&mut self, field_id: i32, datum: Datum) {
@@ -387,6 +398,10 @@ impl MinMaxColAggregator {
             ));
         };
 
+        if self.fields_with_nan_bounds.contains(&field_id) {
+            return Ok(());
+        }
+
         if value.min_is_exact() {
             let Some(min_datum) = get_parquet_stat_min_as_datum(&ty, &value)? else {
                 return Err(Error::new(
@@ -394,6 +409,11 @@ impl MinMaxColAggregator {
                     format!("Statistics {value} is not match with field type {ty}."),
                 ));
             };
+
+            if min_datum.is_nan() {
+                self.invalidate_bounds(field_id);
+                return Ok(());
+            }
 
             self.update_state_min(field_id, min_datum);
         }
@@ -405,6 +425,11 @@ impl MinMaxColAggregator {
                     format!("Statistics {value} is not match with field type {ty}."),
                 ));
             };
+
+            if max_datum.is_nan() {
+                self.invalidate_bounds(field_id);
+                return Ok(());
+            }
 
             self.update_state_max(field_id, max_datum);
         }
@@ -2646,6 +2671,56 @@ mod tests {
 
         assert_eq!(lower_bounds, HashMap::from([(0, Datum::int(i32::MIN))]));
         assert_eq!(upper_bounds, HashMap::from([(0, Datum::int(i32::MAX))]));
+    }
+
+    #[test]
+    fn test_min_max_aggregator_omits_bounds_after_nan_statistic() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(
+                        0,
+                        "col",
+                        Type::Primitive(PrimitiveType::Float),
+                    )
+                    .with_id(0)
+                    .into(),
+                ])
+                .build()
+                .expect("Failed to create schema"),
+        );
+        let mut min_max_agg = MinMaxColAggregator::new(Arc::clone(&schema));
+        let create_statistics = |min, max| {
+            Statistics::Float(ValueStatistics::new(min, max, None, None, false))
+        };
+        min_max_agg
+            .update(0, create_statistics(Some(1.0), Some(2.0)))
+            .unwrap();
+        min_max_agg
+            .update(0, create_statistics(Some(3.0), Some(f32::NAN)))
+            .unwrap();
+        min_max_agg
+            .update(0, create_statistics(Some(-1.0), Some(4.0)))
+            .unwrap();
+
+        let (lower_bounds, upper_bounds) = min_max_agg.produce();
+
+        assert!(lower_bounds.is_empty());
+        assert!(upper_bounds.is_empty());
+
+        let mut min_nan_agg = MinMaxColAggregator::new(schema);
+        min_nan_agg
+            .update(0, create_statistics(Some(f32::NAN), Some(3.0)))
+            .unwrap();
+        min_nan_agg
+            .update(0, create_statistics(Some(-1.0), Some(4.0)))
+            .unwrap();
+
+        let (lower_bounds, upper_bounds) = min_nan_agg.produce();
+
+        assert!(lower_bounds.is_empty());
+        assert!(upper_bounds.is_empty());
     }
 
     fn cdc_test_schema() -> SchemaRef {

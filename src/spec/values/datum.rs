@@ -1091,7 +1091,7 @@ impl Datum {
         let scale = decimal_scale(&value);
         let mantissa = decimal_mantissa(&value);
 
-        Self::decimal_from_mantissa(mantissa, precision, scale)
+        Self::decimal_from_unscaled(mantissa, precision, scale)
     }
 
     fn i64_to_i32<T: Into<i64> + PartialOrd<i64>>(val: T) -> Datum {
@@ -1134,14 +1134,23 @@ impl Datum {
         }
     }
 
-    fn decimal_from_mantissa(
-        mantissa: i128,
+    /// Creates a decimal literal from an unscaled integer coefficient.
+    ///
+    /// The represented value is `unscaled * 10^-scale`. The coefficient must
+    /// fit within `precision` decimal digits.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the precision/scale pair is invalid or the
+    /// coefficient exceeds the declared precision.
+    pub fn decimal_from_unscaled(
+        unscaled: i128,
         precision: u32,
         scale: u32,
     ) -> Result<Self> {
         let r#type = Type::decimal(precision, scale)?;
-        if decimal_precision(mantissa) > precision {
-            let decimal = decimal_from_i128_with_scale(mantissa, scale);
+        if decimal_precision(unscaled) > precision {
+            let decimal = decimal_from_i128_with_scale(unscaled, scale);
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
@@ -1153,7 +1162,7 @@ impl Datum {
         if let Type::Primitive(p) = r#type {
             Ok(Self {
                 r#type: p,
-                literal: PrimitiveLiteral::Int128(mantissa),
+                literal: PrimitiveLiteral::Int128(unscaled),
             })
         } else {
             unreachable!("Decimal type must be primitive.")
@@ -1210,7 +1219,7 @@ impl Datum {
                             scale: target_scale,
                         },
                     ) if self_scale == target_scale => {
-                        Datum::decimal_from_mantissa(*val, *precision, *target_scale)
+                        Datum::decimal_from_unscaled(*val, *precision, *target_scale)
                     }
                     (
                         PrimitiveLiteral::Int128(_),

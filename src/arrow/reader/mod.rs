@@ -29,6 +29,7 @@ mod row_filter;
 mod row_lineage;
 mod row_positions;
 mod selected_rows;
+mod shared_task_reader;
 
 #[cfg(test)]
 mod encryption_tests;
@@ -43,6 +44,7 @@ use projection::{
     add_fallback_field_ids_to_arrow_schema, apply_name_mapping_to_arrow_schema,
 };
 pub use selected_rows::SelectedRowsReadRequest;
+pub use shared_task_reader::SharedTaskArrowReader;
 
 use crate::arrow::caching_delete_file_loader::CachingDeleteFileLoader;
 use crate::io::FileIO;

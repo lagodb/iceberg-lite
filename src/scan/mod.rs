@@ -21,6 +21,8 @@ mod cache;
 use cache::*;
 mod context;
 use context::*;
+mod shared_task_reader;
+pub use shared_task_reader::SharedTaskArrowReader;
 mod task;
 
 use std::sync::Arc;

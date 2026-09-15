@@ -509,6 +509,24 @@ fn avro_bytes_decimal_expect_error() {
     }
 }
 
+#[test]
+fn decimal_from_unscaled_preserves_shape_and_checks_precision() {
+    let datum = Datum::decimal_from_unscaled(-1234, 6, 2).unwrap();
+
+    assert_eq!(
+        datum.data_type(),
+        &PrimitiveType::Decimal {
+            precision: 6,
+            scale: 2,
+        }
+    );
+    assert_eq!(datum.literal(), &PrimitiveLiteral::Int128(-1234));
+    assert_eq!(format!("{datum}"), "-12.34");
+
+    let error = Datum::decimal_from_unscaled(1234, 3, 2).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::DataInvalid);
+}
+
 fn check_raw_literal_bytes_serde_via_avro(
     input_bytes: Vec<u8>,
     expected_literal: Literal,
