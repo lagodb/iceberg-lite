@@ -300,11 +300,14 @@ impl RestTestFixture {
             .expect("test catalog config is valid")
     }
 
-    pub(super) fn catalog_with_auth_manager<'a>(
+    pub(super) fn catalog_with_auth_manager<'a, M>(
         &self,
         extra_props: impl IntoIterator<Item = (&'a str, &'a str)>,
-        auth_manager: Arc<dyn AuthManager>,
-    ) -> RestSessionCatalog {
+        auth_manager: M,
+    ) -> RestSessionCatalog
+    where
+        M: AuthManager + 'static,
+    {
         self.catalog_builder()
             .with_auth_manager(auth_manager)
             .load("test", self.props(extra_props))

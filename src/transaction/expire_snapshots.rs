@@ -98,7 +98,7 @@ impl ExpireSnapshotsAction {
     fn plan(
         &self,
         table: &Table,
-        properties: &TableProperties,
+        properties: &TableProperties<'_>,
     ) -> Result<ExpirePlan> {
         if self.retain_last == Some(0) {
             return Err(Error::new(
@@ -106,9 +106,10 @@ impl ExpireSnapshotsAction {
                 "Number of snapshots to retain must be at least 1",
             ));
         }
-        if properties.max_snapshot_age_ms < 0
-            || properties.min_snapshots_to_keep == 0
-            || properties.max_ref_age_ms < 0
+        let max_snapshot_age_ms = properties.max_snapshot_age_ms()?;
+        let min_snapshots_to_keep = properties.min_snapshots_to_keep()?;
+        let max_ref_age_ms = properties.max_ref_age_ms()?;
+        if max_snapshot_age_ms < 0 || min_snapshots_to_keep == 0 || max_ref_age_ms < 0
         {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -118,12 +119,10 @@ impl ExpireSnapshotsAction {
 
         let metadata = table.metadata();
         let now = self.as_of_ms;
-        let default_cutoff = self.older_than_ms.map_or_else(
-            || Self::age_cutoff(now, properties.max_snapshot_age_ms),
-            Ok,
-        )?;
-        let default_min_to_keep =
-            self.retain_last.unwrap_or(properties.min_snapshots_to_keep);
+        let default_cutoff = self
+            .older_than_ms
+            .map_or_else(|| Self::age_cutoff(now, max_snapshot_age_ms), Ok)?;
+        let default_min_to_keep = self.retain_last.unwrap_or(min_snapshots_to_keep);
 
         let mut removed_ref_names: Vec<String> = vec![];
         let mut retained_refs: Vec<&SnapshotReference> = vec![];
@@ -140,7 +139,7 @@ impl ExpireSnapshotsAction {
                 metadata,
                 snapshot_ref,
                 now,
-                properties.max_ref_age_ms,
+                max_ref_age_ms,
             )? {
                 retained_refs.push(snapshot_ref);
             } else {
@@ -371,9 +370,9 @@ struct ExpirePlan {
 impl TransactionAction for ExpireSnapshotsAction {
     fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
         let metadata = table.metadata();
-        let properties = metadata.table_properties()?;
+        let properties = metadata.table_properties();
 
-        if !properties.gc_enabled {
+        if !properties.gc_enabled()? {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 "Cannot expire snapshots: gc.enabled is false",

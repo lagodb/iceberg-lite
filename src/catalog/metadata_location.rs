@@ -21,7 +21,7 @@ use std::str::FromStr;
 use uuid::Uuid;
 
 use crate::compression::CompressionCodec;
-use crate::spec::{TableMetadata, parse_metadata_file_compression};
+use crate::spec::TableMetadata;
 use crate::{Error, ErrorKind, Result};
 
 /// Default folder name for metadata files under the table location.
@@ -38,21 +38,13 @@ pub struct MetadataLocation {
 }
 
 impl MetadataLocation {
-    fn compression_from_properties(
-        properties: &std::collections::HashMap<String, String>,
-    ) -> CompressionCodec {
-        parse_metadata_file_compression(properties).unwrap_or(CompressionCodec::None)
-    }
-
     /// Creates a new metadata location starting at version 0 from table metadata.
     pub fn try_new_with_metadata(metadata: &TableMetadata) -> Result<Self> {
         Ok(Self {
             location: metadata.metadata_location()?,
             version: 0,
             id: Uuid::new_v4(),
-            compression_codec: Self::compression_from_properties(
-                metadata.properties(),
-            ),
+            compression_codec: metadata.metadata_compression_codec()?,
         })
     }
 
@@ -75,9 +67,7 @@ impl MetadataLocation {
             location: new_metadata.metadata_location()?,
             version: self.version,
             id: self.id,
-            compression_codec: Self::compression_from_properties(
-                new_metadata.properties(),
-            ),
+            compression_codec: new_metadata.metadata_compression_codec()?,
         })
     }
 
@@ -148,12 +138,28 @@ impl FromStr for MetadataLocation {
 
 #[cfg(test)]
 mod test {
+    use std::collections::HashMap;
     use std::str::FromStr;
 
     use uuid::Uuid;
 
-    use crate::MetadataLocation;
     use crate::compression::CompressionCodec;
+    use crate::spec::{Schema, TableMetadata, TableMetadataBuilder, TableProperties};
+    use crate::{ErrorKind, MetadataLocation, TableCreation};
+
+    fn create_test_metadata(properties: HashMap<String, String>) -> TableMetadata {
+        let table_creation = TableCreation::builder()
+            .name("test_table".to_string())
+            .location("/test/table".to_string())
+            .schema(Schema::builder().build().unwrap())
+            .properties(properties)
+            .build();
+        TableMetadataBuilder::from_table_creation(table_creation)
+            .unwrap()
+            .build()
+            .unwrap()
+            .metadata
+    }
 
     fn expected_location(
         location: &str,
@@ -306,5 +312,33 @@ mod test {
             assert_eq!(next.version, input.version + 1);
             assert_ne!(next.id, input.id);
         }
+    }
+
+    #[test]
+    fn test_invalid_metadata_compression_is_rejected() {
+        let metadata = create_test_metadata(HashMap::from([(
+            TableProperties::PROPERTY_METADATA_COMPRESSION_CODEC.to_string(),
+            "snappy".to_string(),
+        )]));
+
+        let error = MetadataLocation::try_new_with_metadata(&metadata).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid metadata compression codec")
+        );
+
+        let current = MetadataLocation::from_str(
+            "/test/table/metadata/00000-2cd22b57-5127-4198-92ba-e4e67c79821b.metadata.json",
+        )
+        .unwrap();
+        let error = current.try_with_new_metadata(&metadata).unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(
+            error
+                .to_string()
+                .contains("Invalid metadata compression codec")
+        );
     }
 }

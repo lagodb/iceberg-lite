@@ -37,6 +37,7 @@ pub(super) struct FileScanTaskReader {
     delete_file_loader: CachingDeleteFileLoader,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
     scan_metrics: ScanMetrics,
 }
@@ -53,6 +54,7 @@ impl FileScanTaskReader {
             delete_file_loader,
             row_group_filtering_enabled: reader.row_group_filtering_enabled,
             row_selection_enabled: reader.row_selection_enabled,
+            bloom_filter_enabled: reader.bloom_filter_enabled,
             parquet_read_options: reader.parquet_read_options,
             scan_metrics,
         }
@@ -73,6 +75,7 @@ impl FileScanTaskReader {
             self.delete_file_loader.clone(),
             self.row_group_filtering_enabled,
             self.row_selection_enabled,
+            self.bloom_filter_enabled,
             self.parquet_read_options,
             self.scan_metrics.clone(),
         )
@@ -105,6 +108,7 @@ pub struct SharedTaskArrowReader {
     tasks: Arc<[FileScanTask]>,
     next_task: usize,
     snapshot_schema: Option<SchemaRef>,
+    case_sensitive: bool,
     base_predicate: Option<Arc<BoundPredicate>>,
     supplemental_predicate: Option<Arc<BoundPredicate>>,
 }
@@ -114,16 +118,21 @@ impl SharedTaskArrowReader {
         reader: ArrowReader,
         tasks: Arc<[FileScanTask]>,
         snapshot_schema: Option<SchemaRef>,
+        case_sensitive: bool,
         base_filter: Option<Predicate>,
     ) -> Result<Self> {
         let base_filter = base_filter.map(Predicate::rewrite_not);
-        let base_predicate =
-            Self::bind_filter(snapshot_schema.as_ref(), base_filter.as_ref())?;
+        let base_predicate = Self::bind_filter(
+            snapshot_schema.as_ref(),
+            base_filter.as_ref(),
+            case_sensitive,
+        )?;
         Ok(Self {
             task_reader: FileScanTaskReader::new(reader),
             tasks,
             next_task: 0,
             snapshot_schema,
+            case_sensitive,
             base_predicate,
             supplemental_predicate: None,
         })
@@ -147,6 +156,7 @@ impl SharedTaskArrowReader {
                     Self::bind_filter(
                         self.snapshot_schema.as_ref(),
                         Some(&supplemental),
+                        self.case_sensitive,
                     )?
                 }
             }
@@ -175,12 +185,18 @@ impl SharedTaskArrowReader {
     fn bind_filter(
         snapshot_schema: Option<&SchemaRef>,
         filter: Option<&Predicate>,
+        case_sensitive: bool,
     ) -> Result<Option<Arc<BoundPredicate>>> {
         match (filter, snapshot_schema) {
-            (Some(filter), Some(schema)) => {
-                Ok(Some(Arc::new(filter.bind(Arc::clone(schema), true)?)))
-            }
+            (Some(filter), Some(schema)) => Ok(Some(Arc::new(
+                filter.bind(Arc::clone(schema), case_sensitive)?,
+            ))),
             (Some(_), None) | (None, _) => Ok(None),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn bloom_filter_enabled(&self) -> bool {
+        self.task_reader.bloom_filter_enabled
     }
 }

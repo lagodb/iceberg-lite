@@ -85,22 +85,29 @@ impl ParquetWriterBuilder {
     /// schema, translating `write.parquet.*` settings into `WriterProperties`
     /// instead of using parquet-rs defaults.
     pub fn from_table_properties(
-        table_props: &TableProperties,
+        table_props: &TableProperties<'_>,
         schema: SchemaRef,
     ) -> Result<Self> {
-        let cdc = table_props.cdc_enabled.then_some(CdcOptions {
-            min_chunk_size: table_props.cdc_min_chunk_size,
-            max_chunk_size: table_props.cdc_max_chunk_size,
-            norm_level: table_props.cdc_norm_level,
-        });
-        let compression = parquet_compression(table_props.parquet_compression_codec)?;
+        let cdc = if table_props.cdc_enabled()? {
+            Some(CdcOptions {
+                min_chunk_size: table_props.cdc_min_chunk_size()?,
+                max_chunk_size: table_props.cdc_max_chunk_size()?,
+                norm_level: table_props.cdc_norm_level()?,
+            })
+        } else {
+            None
+        };
+        let compression =
+            parquet_compression(table_props.parquet_compression_codec()?)?;
         let props = WriterProperties::builder()
             .set_content_defined_chunking(cdc)
             .set_compression(compression)
-            .set_max_row_group_bytes(Some(table_props.parquet_row_group_size_bytes))
-            .set_data_page_size_limit(table_props.parquet_page_size_bytes)
-            .set_data_page_row_count_limit(table_props.parquet_page_row_limit)
-            .set_dictionary_page_size_limit(table_props.parquet_dict_size_bytes)
+            .set_max_row_group_bytes(Some(
+                table_props.parquet_row_group_size_bytes()?,
+            ))
+            .set_data_page_size_limit(table_props.parquet_page_size_bytes()?)
+            .set_data_page_row_count_limit(table_props.parquet_page_row_limit()?)
+            .set_dictionary_page_size_limit(table_props.parquet_dict_size_bytes()?)
             .build();
         Ok(Self::new_with_match_mode(props, schema, FieldMatchMode::Id))
     }
@@ -379,7 +386,7 @@ impl MinMaxColAggregator {
     }
 
     /// Update statistics
-    fn update(&mut self, field_id: i32, value: Statistics) -> Result<()> {
+    fn update(&mut self, field_id: i32, value: &Statistics) -> Result<()> {
         let Some(ty) = self
             .schema
             .field_by_id(field_id)
@@ -403,7 +410,7 @@ impl MinMaxColAggregator {
         }
 
         if value.min_is_exact() {
-            let Some(min_datum) = get_parquet_stat_min_as_datum(&ty, &value)? else {
+            let Some(min_datum) = get_parquet_stat_min_as_datum(&ty, value)? else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
                     format!("Statistics {value} is not match with field type {ty}."),
@@ -419,7 +426,7 @@ impl MinMaxColAggregator {
         }
 
         if value.max_is_exact() {
-            let Some(max_datum) = get_parquet_stat_max_as_datum(&ty, &value)? else {
+            let Some(max_datum) = get_parquet_stat_max_as_datum(&ty, value)? else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
                     format!("Statistics {value} is not match with field type {ty}."),
@@ -537,7 +544,7 @@ impl ParquetWriter {
                                 null_count;
                         }
 
-                        min_max_agg.update(field_id, statistics.clone())?;
+                        min_max_agg.update(field_id, statistics)?;
                     }
                 }
             }
@@ -2655,16 +2662,16 @@ mod tests {
             Statistics::Int32(ValueStatistics::new(min, max, None, None, false))
         };
         min_max_agg
-            .update(0, create_statistics(None, Some(42)))
+            .update(0, &create_statistics(None, Some(42)))
             .unwrap();
         min_max_agg
-            .update(0, create_statistics(Some(0), Some(i32::MAX)))
+            .update(0, &create_statistics(Some(0), Some(i32::MAX)))
             .unwrap();
         min_max_agg
-            .update(0, create_statistics(Some(i32::MIN), None))
+            .update(0, &create_statistics(Some(i32::MIN), None))
             .unwrap();
         min_max_agg
-            .update(0, create_statistics(None, None))
+            .update(0, &create_statistics(None, None))
             .unwrap();
 
         let (lower_bounds, upper_bounds) = min_max_agg.produce();
@@ -2695,13 +2702,13 @@ mod tests {
             Statistics::Float(ValueStatistics::new(min, max, None, None, false))
         };
         min_max_agg
-            .update(0, create_statistics(Some(1.0), Some(2.0)))
+            .update(0, &create_statistics(Some(1.0), Some(2.0)))
             .unwrap();
         min_max_agg
-            .update(0, create_statistics(Some(3.0), Some(f32::NAN)))
+            .update(0, &create_statistics(Some(3.0), Some(f32::NAN)))
             .unwrap();
         min_max_agg
-            .update(0, create_statistics(Some(-1.0), Some(4.0)))
+            .update(0, &create_statistics(Some(-1.0), Some(4.0)))
             .unwrap();
 
         let (lower_bounds, upper_bounds) = min_max_agg.produce();
@@ -2711,10 +2718,10 @@ mod tests {
 
         let mut min_nan_agg = MinMaxColAggregator::new(schema);
         min_nan_agg
-            .update(0, create_statistics(Some(f32::NAN), Some(3.0)))
+            .update(0, &create_statistics(Some(f32::NAN), Some(3.0)))
             .unwrap();
         min_nan_agg
-            .update(0, create_statistics(Some(-1.0), Some(4.0)))
+            .update(0, &create_statistics(Some(-1.0), Some(4.0)))
             .unwrap();
 
         let (lower_bounds, upper_bounds) = min_nan_agg.produce();
@@ -2746,13 +2753,10 @@ mod tests {
         )
     }
 
-    fn table_props(entries: HashMap<String, String>) -> TableProperties {
-        TableProperties::try_from(&entries).unwrap()
-    }
-
     #[test]
     fn test_from_table_properties_no_cdc_by_default() {
-        let tp = table_props(HashMap::new());
+        let entries = HashMap::new();
+        let tp = TableProperties::new(&entries);
         let builder =
             ParquetWriterBuilder::from_table_properties(&tp, cdc_test_schema())
                 .unwrap();
@@ -2769,7 +2773,7 @@ mod tests {
         // written file) keeps this a direct propagation check: every future
         // `write.parquet.*` option just adds an assertion on its corresponding
         // `WriterProperties` getter here.
-        let tp = table_props(HashMap::from([
+        let entries = HashMap::from([
             (
                 TableProperties::PROPERTY_PARQUET_CDC_ENABLED.to_string(),
                 "true".to_string(),
@@ -2786,7 +2790,8 @@ mod tests {
                 TableProperties::PROPERTY_PARQUET_CDC_NORM_LEVEL.to_string(),
                 "2".to_string(),
             ),
-        ]));
+        ]);
+        let tp = TableProperties::new(&entries);
 
         let tmp = TempDir::new().unwrap();
         let output = FileIO::local()
@@ -2812,7 +2817,8 @@ mod tests {
     fn test_from_table_properties_sizing_defaults() {
         // With no properties set, the writer must use Iceberg's defaults (which
         // differ from parquet-rs's own defaults), not parquet-rs's.
-        let tp = table_props(HashMap::new());
+        let entries = HashMap::new();
+        let tp = TableProperties::new(&entries);
         let props =
             ParquetWriterBuilder::from_table_properties(&tp, cdc_test_schema())
                 .unwrap()
@@ -2843,7 +2849,7 @@ mod tests {
 
     #[test]
     fn test_from_table_properties_sizing_and_compression_overrides() {
-        let tp = table_props(HashMap::from([
+        let entries = HashMap::from([
             (
                 TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES.to_string(),
                 "1048576".to_string(),
@@ -2868,7 +2874,8 @@ mod tests {
                 TableProperties::PROPERTY_PARQUET_COMPRESSION_LEVEL.to_string(),
                 "9".to_string(),
             ),
-        ]));
+        ]);
+        let tp = TableProperties::new(&entries);
         let props =
             ParquetWriterBuilder::from_table_properties(&tp, cdc_test_schema())
                 .unwrap()
@@ -2890,7 +2897,9 @@ mod tests {
             TableProperties::PROPERTY_PARQUET_COMPRESSION_CODEC.to_string(),
             "bogus".to_string(),
         )]);
-        let err = TableProperties::try_from(&entries).unwrap_err();
+        let err = TableProperties::new(&entries)
+            .parquet_compression_codec()
+            .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
         assert!(err.to_string().contains("bogus"));
     }

@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 use super::transform::Transform;
-use super::{NestedField, Schema, SchemaRef, StructType};
+use super::{NestedField, PrimitiveType, Schema, SchemaRef, StructType};
 use crate::spec::Struct;
 use crate::{Error, ErrorKind, Result};
 
@@ -105,7 +105,34 @@ impl PartitionSpec {
 
     /// Returns the partition type of this partition spec.
     pub fn partition_type(&self, schema: &Schema) -> Result<StructType> {
-        PartitionSpecBuilder::partition_type(&self.fields, schema)
+        let mut struct_fields = Vec::with_capacity(self.fields.len());
+        for partition_field in &self.fields {
+            let result_type = match schema.field_by_id(partition_field.source_id) {
+                Some(field) => {
+                    partition_field.transform.result_type(&field.field_type)?
+                }
+                None => match partition_field.transform {
+                    Transform::Bucket(_)
+                    | Transform::Year
+                    | Transform::Month
+                    | Transform::Hour => PrimitiveType::Int.into(),
+                    Transform::Day => PrimitiveType::Date.into(),
+                    Transform::Unknown => PrimitiveType::String.into(),
+                    Transform::Identity
+                    | Transform::Truncate(_)
+                    | Transform::Void => PrimitiveType::Unknown.into(),
+                },
+            };
+            struct_fields.push(
+                NestedField::optional(
+                    partition_field.field_id,
+                    &partition_field.name,
+                    result_type,
+                )
+                .into(),
+            );
+        }
+        Ok(StructType::new(struct_fields))
     }
 
     /// Convert to unbound partition spec
@@ -573,40 +600,6 @@ impl PartitionSpecBuilder {
         }
 
         Ok(bound_fields)
-    }
-
-    /// Returns the partition type of this partition spec.
-    fn partition_type(
-        fields: &Vec<PartitionField>,
-        schema: &Schema,
-    ) -> Result<StructType> {
-        let mut struct_fields = Vec::with_capacity(fields.len());
-        for partition_field in fields {
-            let field =
-                schema
-                    .field_by_id(partition_field.source_id)
-                    .ok_or_else(|| {
-                        Error::new(
-                            // This should never occur as check_transform_compatibility
-                            // already ensures that the source field exists in the schema
-                            ErrorKind::Unexpected,
-                            format!(
-                                "No column with source column id {} in schema {:?}",
-                                partition_field.source_id, schema
-                            ),
-                        )
-                    })?;
-            let res_type =
-                partition_field.transform.result_type(&field.field_type)?;
-            let field = NestedField::optional(
-                partition_field.field_id,
-                &partition_field.name,
-                res_type,
-            )
-            .into();
-            struct_fields.push(field);
-        }
-        Ok(StructType::new(struct_fields))
     }
 
     /// Ensure that the partition name is unique among columns in the schema.
@@ -1204,7 +1197,20 @@ mod tests {
             .build()
             .unwrap();
 
-        assert!(partition_spec.partition_type(&schema).is_err());
+        let partition_type = partition_spec.partition_type(&schema).unwrap();
+        let field_types: Vec<_> = partition_type
+            .fields()
+            .iter()
+            .map(|field| field.field_type.as_ref().clone())
+            .collect();
+        assert_eq!(
+            field_types,
+            vec![
+                Type::Primitive(PrimitiveType::Date),
+                Type::Primitive(PrimitiveType::Int),
+                Type::Primitive(PrimitiveType::String),
+            ]
+        );
     }
 
     #[test]
@@ -2051,7 +2057,7 @@ mod tests {
 
         assert_eq!(
             spec.partition_to_path(&data, schema.into()),
-            "id=42/name=alice/ts_hour=1000/empty_void=null"
+            "id=42/name=alice/ts_hour=1970-02-11-16/empty_void=null"
         );
     }
 

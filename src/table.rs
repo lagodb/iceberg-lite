@@ -27,8 +27,8 @@ use crate::io::FileIO;
 use crate::io::object_cache::ObjectCache;
 use crate::scan::TableScanBuilder;
 use crate::spec::{
-    EncryptedKey, ManifestListReader, SchemaRef, SnapshotRef, TableMetadata,
-    TableMetadataRef,
+    EncryptedKey, ManifestListReader, ManifestReader, SchemaRef, SnapshotRef,
+    TableMetadata, TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result, TableIdent};
 
@@ -300,6 +300,11 @@ impl Table {
             self.metadata.clone(),
             self.encryption_manager.clone(),
         )
+    }
+
+    /// Creates a synchronous reader for manifests referenced by this table.
+    pub fn manifest_reader(&self) -> ManifestReader {
+        ManifestReader::new(self.file_io.clone())
     }
 
     /// Creates a table scan.

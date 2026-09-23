@@ -52,7 +52,7 @@ pub(crate) fn drop_table_data(table_info: &Table) -> Result<()> {
         }
     }
 
-    if metadata.table_properties()?.gc_enabled {
+    if metadata.table_properties().gc_enabled()? {
         delete_data_files(file_io, &manifests_to_delete)?;
     }
 

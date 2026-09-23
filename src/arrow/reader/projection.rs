@@ -733,6 +733,8 @@ message schema {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: Some(name_mapping),
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         }];
@@ -839,6 +841,8 @@ message schema {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         }];
@@ -953,6 +957,8 @@ message schema {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         }];
@@ -1075,6 +1081,8 @@ message schema {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         }];
@@ -1181,6 +1189,8 @@ message schema {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         }];
@@ -1299,6 +1309,8 @@ message schema {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         }];
@@ -1442,6 +1454,8 @@ message schema {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         }];
@@ -1560,6 +1574,8 @@ message schema {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         }];
@@ -1690,6 +1706,8 @@ message schema {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         }];
@@ -1845,6 +1863,8 @@ message schema {
             partition_spec: Some(partition_spec),
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         }];

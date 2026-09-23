@@ -51,8 +51,8 @@ impl AesKeySize {
             24 => Ok(Self::Bits192),
             32 => Ok(Self::Bits256),
             _ => Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!("Unsupported data key length: {len} (must be 16, 24, or 32)"),
+                ErrorKind::DataInvalid,
+                format!("Invalid data key length: {len} (must be 16, 24, or 32)"),
             )),
         }
     }
@@ -67,8 +67,8 @@ impl FromStr for AesKeySize {
             "192" | "AES_GCM_192" | "AES192_GCM" => Ok(Self::Bits192),
             "256" | "AES_GCM_256" | "AES256_GCM" => Ok(Self::Bits256),
             _ => Err(Error::new(
-                ErrorKind::FeatureUnsupported,
-                format!("Unsupported AES key size: {s}"),
+                ErrorKind::DataInvalid,
+                format!("Invalid AES key size: {s}"),
             )),
         }
     }

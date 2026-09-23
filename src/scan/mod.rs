@@ -25,6 +25,7 @@ mod shared_task_reader;
 pub use shared_task_reader::SharedTaskArrowReader;
 mod task;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use arrow_array::RecordBatch;
@@ -40,12 +41,8 @@ use crate::metadata_columns::{
     is_metadata_field,
 };
 use crate::overlay::{SnapshotDelta, SnapshotDeltaRemovalLookup};
-use crate::partitioning::compute_unified_partition_type;
 
-use crate::spec::{
-    DEFAULT_SCHEMA_NAME_MAPPING, DataContentType, ManifestContentType, NameMapping,
-    SnapshotRef,
-};
+use crate::spec::{DataContentType, ManifestContentType, SnapshotRef};
 use crate::table::Table;
 use crate::util::available_parallelism;
 use crate::{Error, ErrorKind, Result};
@@ -67,6 +64,7 @@ pub struct TableScanBuilder<'a> {
     concurrency_limit_manifest_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    bloom_filter_enabled: bool,
     delta: Option<Arc<SnapshotDelta>>,
 }
 
@@ -94,6 +92,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            bloom_filter_enabled: false,
             delta: None,
         }
     }
@@ -220,6 +219,12 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
+    /// Enables Parquet bloom-filter row-group pruning for equality and IN predicates.
+    pub fn with_bloom_filter_enabled(mut self, bloom_filter_enabled: bool) -> Self {
+        self.bloom_filter_enabled = bloom_filter_enabled;
+        self
+    }
+
     /// Layer a transaction-local snapshot delta over the committed table state.
     pub fn with_delta(mut self, delta: Arc<SnapshotDelta>) -> Self {
         self.delta = Some(delta);
@@ -262,6 +267,7 @@ impl<'a> TableScanBuilder<'a> {
                             .concurrency_limit_manifest_files,
                         row_group_filtering_enabled: self.row_group_filtering_enabled,
                         row_selection_enabled: self.row_selection_enabled,
+                        bloom_filter_enabled: self.bloom_filter_enabled,
                     });
                 }
                 current_snapshot
@@ -282,16 +288,12 @@ impl<'a> TableScanBuilder<'a> {
             }
         };
 
-        let field_ids = self.projection.field_ids(&schema)?;
+        let field_ids = self.projection.field_ids(&schema, self.case_sensitive)?;
         let unified_partition_type =
             if field_ids.contains(&RESERVED_FIELD_ID_PARTITION) {
-                Some(Arc::new(compute_unified_partition_type(
-                    self.table
-                        .metadata()
-                        .partition_specs_iter()
-                        .map(AsRef::as_ref),
-                    &schema,
-                )?))
+                Some(Arc::new(
+                    self.table.metadata().unified_partition_type(&schema)?,
+                ))
             } else {
                 None
             };
@@ -324,7 +326,7 @@ impl<'a> TableScanBuilder<'a> {
         // later, its PG core parser integration must normalize to this same
         // binder input rather than creating a second execution path.
         let snapshot_bound_predicate = if let Some(ref predicates) = self.filter {
-            Some(predicates.bind(schema.clone(), true)?)
+            Some(predicates.bind(schema.clone(), self.case_sensitive)?)
         } else {
             None
         };
@@ -332,21 +334,17 @@ impl<'a> TableScanBuilder<'a> {
         let name_mapping = self
             .table
             .metadata()
-            .properties()
-            .get(DEFAULT_SCHEMA_NAME_MAPPING)
-            .map(|raw| {
-                serde_json::from_str::<NameMapping>(raw).map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Failed to parse table property {DEFAULT_SCHEMA_NAME_MAPPING} as a NameMapping"
-                        ),
-                    )
-                    .with_source(e)
-                })
-            })
-            .transpose()?
+            .table_properties()
+            .default_name_mapping()?
             .map(Arc::new);
+
+        let sort_orders = Arc::new(
+            self.table
+                .metadata()
+                .sort_orders_iter()
+                .map(|order| (order.order_id, order.clone()))
+                .collect::<HashMap<_, _>>(),
+        );
 
         let plan_context = PlanContext {
             snapshot,
@@ -362,6 +360,7 @@ impl<'a> TableScanBuilder<'a> {
             manifest_evaluator_cache: Arc::new(ManifestEvaluatorCache::new()),
             expression_evaluator_cache: Arc::new(ExpressionEvaluatorCache::new()),
             unified_partition_type,
+            sort_orders,
         };
 
         Ok(TableScan {
@@ -376,6 +375,7 @@ impl<'a> TableScanBuilder<'a> {
             concurrency_limit_manifest_files: self.concurrency_limit_manifest_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            bloom_filter_enabled: self.bloom_filter_enabled,
         })
     }
 }
@@ -388,7 +388,11 @@ impl ScanProjection {
         }
     }
 
-    fn field_ids(&self, schema: &crate::spec::Schema) -> Result<Vec<i32>> {
+    fn field_ids(
+        &self,
+        schema: &crate::spec::Schema,
+        case_sensitive: bool,
+    ) -> Result<Vec<i32>> {
         match self {
             Self::All => Ok(schema
                 .as_struct()
@@ -404,8 +408,14 @@ impl ScanProjection {
                         continue;
                     }
 
-                    let field_id =
-                        schema.field_id_by_name(column_name).ok_or_else(|| {
+                    let field_id = if case_sensitive {
+                        schema.field_id_by_name(column_name)
+                    } else {
+                        schema
+                            .field_by_name_case_insensitive(column_name)
+                            .map(|field| field.id)
+                    }
+                    .ok_or_else(|| {
                             Error::new(
                                 ErrorKind::DataInvalid,
                                 format!(
@@ -486,6 +496,7 @@ pub struct TableScan {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    bloom_filter_enabled: bool,
 }
 
 enum FilePlanAccumulator {
@@ -643,7 +654,8 @@ impl TableScan {
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
             .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
-            .with_row_selection_enabled(self.row_selection_enabled);
+            .with_row_selection_enabled(self.row_selection_enabled)
+            .with_bloom_filter_enabled(self.bloom_filter_enabled);
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
@@ -665,7 +677,8 @@ impl TableScan {
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
             .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
-            .with_row_selection_enabled(self.row_selection_enabled);
+            .with_row_selection_enabled(self.row_selection_enabled)
+            .with_bloom_filter_enabled(self.bloom_filter_enabled);
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
@@ -688,11 +701,10 @@ impl TableScan {
         filter: Option<Predicate>,
     ) -> Result<ArrowRecordBatchIterator> {
         let bound_filter = match (filter, self.plan_context.as_ref()) {
-            (Some(filter), Some(plan_context)) => Some(
-                filter
-                    .rewrite_not()
-                    .bind(plan_context.snapshot_schema.clone(), true)?,
-            ),
+            (Some(filter), Some(plan_context)) => Some(filter.rewrite_not().bind(
+                plan_context.snapshot_schema.clone(),
+                plan_context.case_sensitive,
+            )?),
             (Some(_), None) | (None, _) => None,
         };
 
@@ -742,18 +754,18 @@ impl TableScan {
         batch_size: Option<usize>,
     ) -> Result<ArrowRecordBatchIterator> {
         let bound_filter = match (filter, self.plan_context.as_ref()) {
-            (Some(filter), Some(plan_context)) => Some(
-                filter
-                    .rewrite_not()
-                    .bind(plan_context.snapshot_schema.clone(), true)?,
-            ),
+            (Some(filter), Some(plan_context)) => Some(filter.rewrite_not().bind(
+                plan_context.snapshot_schema.clone(),
+                plan_context.case_sensitive,
+            )?),
             (Some(_), None) | (None, _) => None,
         };
 
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
             .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
-            .with_row_selection_enabled(self.row_selection_enabled);
+            .with_row_selection_enabled(self.row_selection_enabled)
+            .with_bloom_filter_enabled(self.bloom_filter_enabled);
 
         if let Some(batch_size) = batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
@@ -775,7 +787,8 @@ impl TableScan {
         let mut arrow_reader_builder = ArrowReaderBuilder::new(self.file_io.clone())
             .with_data_file_concurrency_limit(self.concurrency_limit_data_files)
             .with_row_group_filtering_enabled(self.row_group_filtering_enabled)
-            .with_row_selection_enabled(true);
+            .with_row_selection_enabled(true)
+            .with_bloom_filter_enabled(self.bloom_filter_enabled);
 
         if let Some(batch_size) = self.batch_size {
             arrow_reader_builder = arrow_reader_builder.with_batch_size(batch_size);
@@ -1829,7 +1842,7 @@ pub mod tests {
                     .file_format(DataFileFormat::Parquet)
                     .file_size_in_bytes(0)
                     .record_count(1)
-                    .partition(Struct::empty())
+                    .partition(Struct::from_iter([Some(Literal::long(1))]))
                     .build()
                     .unwrap(),
             )
@@ -2556,6 +2569,8 @@ pub mod tests {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         };
@@ -2580,6 +2595,8 @@ pub mod tests {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         };

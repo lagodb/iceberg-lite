@@ -414,6 +414,8 @@ mod tests {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: true,
             key_metadata: None,
         };
@@ -595,6 +597,8 @@ mod tests {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         }];
@@ -791,6 +795,8 @@ mod tests {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         };
@@ -814,6 +820,8 @@ mod tests {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         };
@@ -880,5 +888,103 @@ mod tests {
 
             assert_eq!(first_val, 100, "Task 2 should start with id=100, not id=0");
         }
+    }
+
+    #[test]
+    fn bloom_filter_pushdown_prunes_sync_file_reads() {
+        const ROWS_PER_GROUP: i32 = 5_000;
+        const GROUPS: i32 = 3;
+        const STRIDE: i32 = 30;
+
+        let temp_dir = TempDir::new().unwrap();
+        let file_path = temp_dir.path().join("bloom_filter.parquet");
+        let arrow_schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("id", DataType::Int32, false).with_metadata(HashMap::from([
+                (PARQUET_FIELD_ID_META_KEY.to_owned(), "1".to_owned()),
+            ])),
+        ]));
+        let properties = WriterProperties::builder()
+            .set_compression(Compression::UNCOMPRESSED)
+            .set_bloom_filter_enabled(true)
+            .set_bloom_filter_max_ndv(ROWS_PER_GROUP as u64)
+            .build();
+        let mut writer = ArrowWriter::try_new(
+            File::create(&file_path).unwrap(),
+            arrow_schema.clone(),
+            Some(properties),
+        )
+        .unwrap();
+        for group in 0..GROUPS {
+            let values = (0..ROWS_PER_GROUP)
+                .map(|index| index * STRIDE + group)
+                .collect::<Vec<_>>();
+            writer
+                .write(
+                    &RecordBatch::try_new(
+                        arrow_schema.clone(),
+                        vec![Arc::new(Int32Array::from(values))],
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            writer.flush().unwrap();
+        }
+        writer.close().unwrap();
+
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "id",
+                    Type::Primitive(PrimitiveType::Int),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        // Seven is within every row group's min/max range but absent from every
+        // group, so only the bloom filter can avoid reading the data pages.
+        let predicate = Reference::new("id")
+            .equal_to(Datum::int(7))
+            .bind(schema.clone(), true)
+            .unwrap();
+        let file_size = std::fs::metadata(&file_path).unwrap().len();
+        let path = file_path.to_string_lossy().into_owned();
+        let file_io = FileIO::from_path(temp_dir.path().to_str().unwrap()).unwrap();
+
+        let read = |bloom_filter_enabled| {
+            let task = FileScanTask::builder()
+                .with_file_size_in_bytes(file_size)
+                .with_start(0)
+                .with_length(file_size)
+                .with_record_count(Some((ROWS_PER_GROUP * GROUPS) as u64))
+                .with_data_file_path(path.clone())
+                .with_data_file_format(DataFileFormat::Parquet)
+                .with_schema(schema.clone())
+                .with_project_field_ids(vec![1])
+                .with_predicate(Some(predicate.clone()))
+                .with_case_sensitive(true)
+                .build();
+            let result = ArrowReaderBuilder::new(file_io.clone())
+                .with_metadata_size_hint(4 * 1024)
+                .with_bloom_filter_enabled(bloom_filter_enabled)
+                .build()
+                .read_with_metrics(vec![task])
+                .unwrap();
+            let metrics = result.metrics().clone();
+            let rows = result
+                .stream()
+                .map(|batch| batch.unwrap().num_rows())
+                .sum::<usize>();
+            (rows, metrics.bytes_read())
+        };
+
+        let (rows_without_bloom, bytes_without_bloom) = read(false);
+        let (rows_with_bloom, bytes_with_bloom) = read(true);
+        assert_eq!(rows_without_bloom, 0);
+        assert_eq!(rows_with_bloom, 0);
+        assert!(
+            bytes_with_bloom < bytes_without_bloom,
+            "bloom pruning should reduce sync reads: {bytes_with_bloom} vs {bytes_without_bloom}"
+        );
     }
 }

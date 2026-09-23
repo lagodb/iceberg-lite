@@ -134,8 +134,16 @@ impl RestCatalogBuilder {
         self
     }
 
-    /// Injects a custom auth manager, overriding the `rest.auth.type` configuration.
-    pub fn with_auth_manager(mut self, auth_manager: Arc<dyn AuthManager>) -> Self {
+    /// Sets a custom auth manager, overriding the `rest.auth.type` configuration.
+    ///
+    /// The builder takes ownership because an auth manager is scoped to one
+    /// catalog. The loaded catalog may share it across that catalog's sessions
+    /// and requests, but callers cannot accidentally reuse its initialization
+    /// state for another catalog.
+    pub fn with_auth_manager<M>(mut self, auth_manager: M) -> Self
+    where
+        M: AuthManager + 'static,
+    {
         self.inner = self.inner.with_auth_manager(auth_manager);
         self
     }
@@ -731,12 +739,12 @@ impl RestSessionCatalog {
     /// Creates a `RestSessionCatalog` from a [`RestCatalogConfig`].
     fn new(
         config: RestCatalogConfig,
-        auth_manager: Option<Arc<dyn AuthManager>>,
+        auth_manager: Option<Box<dyn AuthManager>>,
         storage_factory: Option<Arc<dyn StorageFactory>>,
         kms_client: Option<Arc<dyn KeyManagementClient>>,
     ) -> Self {
         Self {
-            auth_manager,
+            auth_manager: auth_manager.map(Arc::from),
             user_config: config,
             client: OnceCell::new(),
             storage_factory,
@@ -1589,7 +1597,7 @@ impl RestSessionCatalog {
 #[derive(Debug)]
 pub struct RestSessionCatalogBuilder {
     config: RestCatalogConfig,
-    auth_manager: Option<Arc<dyn AuthManager>>,
+    auth_manager: Option<Box<dyn AuthManager>>,
     storage_factory: Option<Arc<dyn StorageFactory>>,
     kms_client_factory: Option<Arc<dyn KmsClientFactory>>,
 }
@@ -1618,9 +1626,14 @@ impl RestSessionCatalogBuilder {
         self
     }
 
-    /// Injects a custom auth manager, overriding the `rest.auth.type` configuration.
-    pub fn with_auth_manager(mut self, auth_manager: Arc<dyn AuthManager>) -> Self {
-        self.auth_manager = Some(auth_manager);
+    /// Sets a custom auth manager, overriding the `rest.auth.type` configuration.
+    ///
+    /// The manager is exclusively owned by the catalog built from this builder.
+    pub fn with_auth_manager<M>(mut self, auth_manager: M) -> Self
+    where
+        M: AuthManager + 'static,
+    {
+        self.auth_manager = Some(Box::new(auth_manager));
         self
     }
 

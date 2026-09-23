@@ -197,8 +197,10 @@ impl CachingDeleteFileLoader {
         iterator: ArrowRecordBatchIterator,
     ) -> Result<HashMap<String, DeleteVector>> {
         let mut result: HashMap<String, DeleteVector> = HashMap::default();
+        let mut run_positions = Vec::new();
 
         for batch in iterator {
+            debug_assert!(run_positions.is_empty());
             let batch = batch?;
             let columns = batch.columns();
 
@@ -217,6 +219,11 @@ impl CachingDeleteFileLoader {
                 ));
             };
 
+            // Position deletes are normally ordered by (path, position). Buffer
+            // each contiguous path run so hashing and path allocation happen
+            // once per run rather than once per deleted row. Keep an owned path
+            // because this reader also accepts dictionary-encoded path arrays.
+            let mut run_path: Option<String> = None;
             Self::visit_position_delete_paths(
                 columns[0].as_ref(),
                 |row, file_path| {
@@ -239,19 +246,53 @@ impl CachingDeleteFileLoader {
                         )
                     })?;
 
-                    if let Some(delete_vector) = result.get_mut(file_path) {
-                        delete_vector.insert(pos);
-                    } else {
-                        let mut delete_vector = DeleteVector::default();
-                        delete_vector.insert(pos);
-                        result.insert(file_path.to_owned(), delete_vector);
+                    if run_path.as_deref() != Some(file_path) {
+                        if let Some(previous_path) = run_path.as_deref() {
+                            Self::merge_delete_positions(
+                                &mut result,
+                                previous_path,
+                                &run_positions,
+                            );
+                            run_positions.clear();
+                        }
+                        run_path = Some(file_path.to_owned());
                     }
+                    run_positions.push(pos);
                     Ok(())
                 },
             )?;
+
+            if let Some(previous_path) = run_path.as_deref() {
+                Self::merge_delete_positions(
+                    &mut result,
+                    previous_path,
+                    &run_positions,
+                );
+                run_positions.clear();
+            }
         }
 
         Ok(result)
+    }
+
+    fn merge_delete_positions(
+        result: &mut HashMap<String, DeleteVector>,
+        file_path: &str,
+        positions: &[u64],
+    ) {
+        debug_assert!(!positions.is_empty());
+        let delete_vector = result.entry(file_path.to_owned()).or_default();
+        if let Err(error) = delete_vector.insert_positions(positions) {
+            tracing::debug!(
+                file_path,
+                run_len = positions.len(),
+                error = %error,
+                "positional delete run fell back to per-position insertion"
+            );
+            for &position in positions {
+                delete_vector.insert(position);
+            }
+        }
     }
 
     fn visit_position_delete_paths<F>(file_paths: &dyn Array, visit: F) -> Result<()>
@@ -679,6 +720,40 @@ mod tests {
         let b_positions: Vec<_> = deletes["data/b.parquet"].iter().collect();
         assert_eq!(a_positions, vec![1, 2]);
         assert_eq!(b_positions, vec![3]);
+    }
+
+    #[test]
+    fn test_parse_positional_deletes_merges_runs_across_batches() {
+        let schema = Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("file_path", DataType::Utf8, false),
+            Field::new("pos", DataType::Int64, false),
+        ]));
+        let batch = |paths: Vec<&str>, positions: Vec<i64>| {
+            RecordBatch::try_new(
+                schema.clone(),
+                vec![
+                    Arc::new(StringArray::from_iter_values(paths)) as ArrayRef,
+                    Arc::new(Int64Array::from_iter_values(positions)) as ArrayRef,
+                ],
+            )
+            .unwrap()
+        };
+        let iterator: ArrowRecordBatchIterator = Box::new(
+            [
+                batch(vec!["a", "a", "b", "a"], vec![3, 3, 2, 1]),
+                batch(vec!["a", "a"], vec![5, 4]),
+            ]
+            .into_iter()
+            .map(Ok),
+        );
+
+        let deletes =
+            CachingDeleteFileLoader::parse_positional_deletes_record_batch_iterator(
+                iterator,
+            )
+            .unwrap();
+        assert_eq!(deletes["a"].iter().collect::<Vec<_>>(), vec![1, 3, 4, 5]);
+        assert_eq!(deletes["b"].iter().collect::<Vec<_>>(), vec![2]);
     }
 
     #[test]
@@ -1114,6 +1189,8 @@ mod tests {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         };
@@ -1213,6 +1290,8 @@ mod tests {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: true,
             key_metadata: None,
         };

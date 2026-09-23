@@ -23,6 +23,8 @@ mod entry;
 pub use entry::*;
 mod metadata;
 pub use metadata::*;
+mod reader;
+pub use reader::*;
 mod writer;
 use std::sync::Arc;
 
@@ -31,7 +33,7 @@ pub use writer::*;
 
 use super::{
     Datum, FormatVersion, ManifestContentType, PartitionSpec, PrimitiveType, Schema,
-    Struct, UNASSIGNED_SEQUENCE_NUMBER,
+    Struct, Type, UNASSIGNED_SEQUENCE_NUMBER,
 };
 use crate::error::Result;
 use crate::{Error, ErrorKind};
@@ -57,6 +59,7 @@ impl Manifest {
         // Parse manifest entries
         let partition_type =
             metadata.partition_spec.partition_type(&metadata.schema)?;
+        let partition_struct_type = Type::Struct(partition_type.clone());
 
         let entries = match metadata.format_version {
             FormatVersion::V1 => {
@@ -67,7 +70,7 @@ impl Manifest {
                     .map(|value| {
                         from_value::<_serde::ManifestEntryV1>(&value?)?.try_into(
                             metadata.partition_spec.spec_id(),
-                            &partition_type,
+                            &partition_struct_type,
                             &metadata.schema,
                         )
                     })
@@ -82,7 +85,7 @@ impl Manifest {
                     .map(|value| {
                         from_value::<_serde::ManifestEntryV2>(&value?)?.try_into(
                             metadata.partition_spec.spec_id(),
-                            &partition_type,
+                            &partition_struct_type,
                             &metadata.schema,
                         )
                     })
@@ -130,8 +133,12 @@ pub fn serialize_data_file_to_json(
     partition_type: &super::StructType,
     format_version: FormatVersion,
 ) -> Result<String> {
-    let serde =
-        _serde::DataFileSerde::try_from(data_file, partition_type, format_version)?;
+    let partition_struct_type = Type::Struct(partition_type.clone());
+    let serde = _serde::DataFileSerde::try_from(
+        data_file,
+        &partition_struct_type,
+        format_version,
+    )?;
     serde_json::to_string(&serde).map_err(|e| {
         Error::new(
             ErrorKind::DataInvalid,
@@ -156,7 +163,8 @@ pub fn deserialize_data_file_from_json(
         .with_source(e)
     })?;
 
-    serde.try_into(partition_spec_id, partition_type, schema)
+    let partition_struct_type = Type::Struct(partition_type.clone());
+    serde.try_into(partition_spec_id, &partition_struct_type, schema)
 }
 
 #[cfg(test)]

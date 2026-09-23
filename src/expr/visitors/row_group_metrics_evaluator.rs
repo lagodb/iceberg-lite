@@ -312,13 +312,23 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
             return ROW_GROUP_CANT_MATCH;
         }
 
-        if let Some(lower_bound) = self.min_value(field_id)?
+        let Some((stats, primitive_type)) =
+            self.stats_and_type_for_field_id(field_id)?
+        else {
+            return ROW_GROUP_MIGHT_MATCH;
+        };
+
+        if let Some(lower_bound) =
+            get_parquet_stat_min_as_datum(&primitive_type, stats)?
+            && !lower_bound.is_nan()
             && lower_bound.gt(datum)
         {
             return ROW_GROUP_CANT_MATCH;
         }
 
-        if let Some(upper_bound) = self.max_value(field_id)?
+        if let Some(upper_bound) =
+            get_parquet_stat_max_as_datum(&primitive_type, stats)?
+            && !upper_bound.is_nan()
             && upper_bound.lt(datum)
         {
             return ROW_GROUP_CANT_MATCH;
@@ -358,7 +368,15 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
             ));
         };
 
-        if let Some(lower_bound) = self.min_value(field_id)? {
+        let Some((stats, primitive_type)) =
+            self.stats_and_type_for_field_id(field_id)?
+        else {
+            return ROW_GROUP_MIGHT_MATCH;
+        };
+
+        if let Some(lower_bound) =
+            get_parquet_stat_min_as_datum(&primitive_type, stats)?
+        {
             let PrimitiveLiteral::String(lower_bound) = lower_bound.literal() else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
@@ -378,7 +396,9 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
             }
         }
 
-        if let Some(upper_bound) = self.max_value(field_id)? {
+        if let Some(upper_bound) =
+            get_parquet_stat_max_as_datum(&primitive_type, stats)?
+        {
             let PrimitiveLiteral::String(upper_bound) = upper_bound.literal() else {
                 return Err(Error::new(
                     ErrorKind::Unexpected,
@@ -487,17 +507,25 @@ impl BoundPredicateVisitor for RowGroupMetricsEvaluator<'_> {
             return ROW_GROUP_MIGHT_MATCH;
         }
 
-        if let Some(lower_bound) = self.min_value(field_id)?
+        let Some((stats, primitive_type)) =
+            self.stats_and_type_for_field_id(field_id)?
+        else {
+            return ROW_GROUP_MIGHT_MATCH;
+        };
+
+        if let Some(lower_bound) =
+            get_parquet_stat_min_as_datum(&primitive_type, stats)?
+            && !lower_bound.is_nan()
             && !literals.iter().any(|datum| datum.ge(&lower_bound))
         {
-            // if all values are less than lower bound, rows cannot match.
             return ROW_GROUP_CANT_MATCH;
         }
 
-        if let Some(upper_bound) = self.max_value(field_id)?
+        if let Some(upper_bound) =
+            get_parquet_stat_max_as_datum(&primitive_type, stats)?
+            && !upper_bound.is_nan()
             && !literals.iter().any(|datum| datum.le(&upper_bound))
         {
-            // if all values are greater than upper bound, rows cannot match.
             return ROW_GROUP_CANT_MATCH;
         }
 

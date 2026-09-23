@@ -311,16 +311,26 @@ impl PredicateConverter<'_> {
     /// Build an Arrow predicate that always returns true.
     fn build_always_true(&self) -> Result<Box<PredicateResult>> {
         Ok(Box::new(|batch| {
-            Ok(BooleanArray::from(vec![true; batch.num_rows()]))
+            Ok(constant_bool_array(true, batch.num_rows()))
         }))
     }
 
     /// Build an Arrow predicate that always returns false.
     fn build_always_false(&self) -> Result<Box<PredicateResult>> {
         Ok(Box::new(|batch| {
-            Ok(BooleanArray::from(vec![false; batch.num_rows()]))
+            Ok(constant_bool_array(false, batch.num_rows()))
         }))
     }
+}
+
+fn constant_bool_array(value: bool, len: usize) -> BooleanArray {
+    let buffer = if value {
+        BooleanBuffer::new_set(len)
+    } else {
+        BooleanBuffer::new_unset(len)
+    };
+
+    BooleanArray::new(buffer, None)
 }
 
 /// Gets the leaf column from the record batch for the required column index. Only
@@ -657,7 +667,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
                 // update this if arrow ever adds a native is_in kernel
                 let left = project_column(batch, idx)?;
 
-                let mut acc = BooleanArray::from(vec![false; batch.num_rows()]);
+                let mut acc = constant_bool_array(false, batch.num_rows());
                 for literal in &literals {
                     let literal = try_cast_literal(literal, left.data_type())?;
                     acc = or(&acc, &eq(&left, literal.as_ref())?)?
@@ -686,7 +696,7 @@ impl BoundPredicateVisitor for PredicateConverter<'_> {
             Ok(Box::new(move |batch| {
                 // update this if arrow ever adds a native not_in kernel
                 let left = project_column(batch, idx)?;
-                let mut acc = BooleanArray::from(vec![true; batch.num_rows()]);
+                let mut acc = constant_bool_array(true, batch.num_rows());
                 for literal in &literals {
                     let literal = try_cast_literal(literal, left.data_type())?;
                     acc = and(&acc, &neq(&left, literal.as_ref())?)?

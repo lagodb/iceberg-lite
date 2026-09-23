@@ -29,7 +29,7 @@ use crate::spec::{
     MAIN_BRANCH, Manifest, ManifestContentType, ManifestFile, ManifestListWriter,
     ManifestWriter, ManifestWriterBuilder, Operation, PartitionSpecRef, Snapshot,
     SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct,
-    StructType, Summary, TableProperties, update_snapshot_summaries,
+    StructType, Summary, update_snapshot_summaries,
 };
 use crate::table::Table;
 use crate::transaction::{ActionCommit, TransactionAction};
@@ -319,7 +319,7 @@ impl<'a> DeltaSnapshotProducer<'a> {
         semantics: DeltaCommitSemantics,
     ) -> Result<ActionCommit> {
         let truncate_full_table = plan.removals.truncates_base();
-        let mut summary_collector = self.new_summary_collector();
+        let mut summary_collector = self.new_summary_collector()?;
         let mut manifests =
             self.rewrite_removed_manifests(&plan.removals, &mut summary_collector)?;
 
@@ -756,19 +756,15 @@ impl<'a> DeltaSnapshotProducer<'a> {
         )
     }
 
-    fn new_summary_collector(&self) -> SnapshotSummaryCollector {
+    fn new_summary_collector(&self) -> Result<SnapshotSummaryCollector> {
         let mut summary_collector = SnapshotSummaryCollector::default();
         let limit = self
             .table
             .metadata()
-            .properties()
-            .get(TableProperties::PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT)
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(
-                TableProperties::PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT,
-            );
+            .table_properties()
+            .write_partition_summary_limit()?;
         summary_collector.set_partition_summary_limit(limit);
-        summary_collector
+        Ok(summary_collector)
     }
 
     fn collect_added_file(

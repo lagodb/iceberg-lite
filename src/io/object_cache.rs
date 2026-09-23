@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crate::encryption::EncryptionManager;
 use crate::io::FileIO;
 use crate::spec::{
-    FormatVersion, Manifest, ManifestFile, ManifestList, SchemaId, SnapshotRef,
+    FormatVersion, Manifest, ManifestFile, ManifestList, ManifestReader, SnapshotRef,
     TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
@@ -36,7 +36,7 @@ pub(crate) enum CachedItem {
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) enum CachedObjectKey {
-    ManifestList((String, FormatVersion, SchemaId)),
+    ManifestList((String, FormatVersion)),
     Manifest((String, Option<u64>)),
 }
 
@@ -124,7 +124,9 @@ impl ObjectCache {
         manifest_file: &ManifestFile,
     ) -> Result<Arc<Manifest>> {
         if self.cache_disabled {
-            return manifest_file.load_manifest(&self.file_io).map(Arc::new);
+            return ManifestReader::new(self.file_io.clone())
+                .read(manifest_file)
+                .map(Arc::new);
         }
 
         let key = CachedObjectKey::Manifest((
@@ -177,7 +179,6 @@ impl ObjectCache {
         let key = CachedObjectKey::ManifestList((
             snapshot.manifest_list().to_string(),
             table_metadata.format_version,
-            snapshot.schema_id().unwrap(),
         ));
         let cache_entry = self
             .cache
@@ -207,7 +208,8 @@ impl ObjectCache {
         &self,
         manifest_file: &ManifestFile,
     ) -> Result<CachedItem> {
-        let manifest = manifest_file.load_manifest(&self.file_io)?;
+        let manifest =
+            ManifestReader::new(self.file_io.clone()).read(manifest_file)?;
 
         Ok(CachedItem::Manifest(Arc::new(manifest)))
     }

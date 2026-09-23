@@ -19,7 +19,6 @@
  * Data Types
  */
 use std::collections::HashMap;
-use std::convert::identity;
 use std::fmt;
 use std::ops::Index;
 use std::sync::{Arc, OnceLock};
@@ -145,7 +144,9 @@ impl Type {
     pub(crate) fn min_format_version(&self) -> FormatVersion {
         match self {
             Type::Primitive(
-                PrimitiveType::TimestampNs | PrimitiveType::TimestamptzNs,
+                PrimitiveType::Unknown
+                | PrimitiveType::TimestampNs
+                | PrimitiveType::TimestamptzNs,
             )
             | Type::Variant(_) => FormatVersion::V3,
             _ => FormatVersion::V1,
@@ -278,6 +279,8 @@ pub enum PrimitiveType {
     Fixed(u64),
     /// Arbitrary-length byte array.
     Binary,
+    /// Default/null column type used when a more specific type is not known.
+    Unknown,
 }
 
 impl PrimitiveType {
@@ -418,6 +421,7 @@ where
 impl fmt::Display for PrimitiveType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
+            PrimitiveType::Unknown => write!(f, "unknown"),
             PrimitiveType::Boolean => write!(f, "boolean"),
             PrimitiveType::Int => write!(f, "int"),
             PrimitiveType::Long => write!(f, "long"),
@@ -592,7 +596,7 @@ impl fmt::Display for StructType {
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize, Eq, Clone)]
-#[serde(from = "SerdeNestedField", into = "SerdeNestedField")]
+#[serde(try_from = "SerdeNestedField", into = "SerdeNestedField")]
 /// A struct is a tuple of typed values. Each field in the tuple is named and has an integer id that is unique in the table schema.
 /// Each field can be either optional or required, meaning that values can (or cannot) be null. Fields may be any type.
 /// Fields may have an optional comment or doc string. Fields can have default values.
@@ -629,25 +633,30 @@ struct SerdeNestedField {
     pub write_default: Option<JsonValue>,
 }
 
-impl From<SerdeNestedField> for NestedField {
-    fn from(value: SerdeNestedField) -> Self {
-        NestedField {
+impl TryFrom<SerdeNestedField> for NestedField {
+    type Error = crate::Error;
+
+    fn try_from(value: SerdeNestedField) -> Result<Self> {
+        let initial_default = value
+            .initial_default
+            .map(|x| Literal::try_from_json(x, &value.field_type))
+            .transpose()?
+            .flatten();
+        let write_default = value
+            .write_default
+            .map(|x| Literal::try_from_json(x, &value.field_type))
+            .transpose()?
+            .flatten();
+
+        Ok(NestedField {
             id: value.id,
             name: value.name,
             required: value.required,
-            initial_default: value.initial_default.and_then(|x| {
-                Literal::try_from_json(x, &value.field_type)
-                    .ok()
-                    .and_then(identity)
-            }),
-            write_default: value.write_default.and_then(|x| {
-                Literal::try_from_json(x, &value.field_type)
-                    .ok()
-                    .and_then(identity)
-            }),
+            initial_default,
+            write_default,
             field_type: value.field_type,
             doc: value.doc,
-        }
+        })
     }
 }
 
@@ -1480,6 +1489,31 @@ mod tests {
         let serialized = serde_json::to_string(&field).unwrap();
         let roundtrip: NestedField = serde_json::from_str(&serialized).unwrap();
         assert_eq!(field, roundtrip);
+    }
+
+    #[test]
+    fn nested_field_rejects_invalid_map_defaults() {
+        for default_name in ["initial-default", "write-default"] {
+            let json = format!(
+                r#"{{
+                    "id": 1,
+                    "name": "properties",
+                    "required": false,
+                    "type": {{
+                        "type": "map",
+                        "key-id": 2,
+                        "key": "string",
+                        "value-id": 3,
+                        "value-required": false,
+                        "value": "int"
+                    }},
+                    "{default_name}": {{"keys": ["a", "b"], "values": [1]}}
+                }}"#
+            );
+
+            let error = serde_json::from_str::<NestedField>(&json).unwrap_err();
+            assert!(error.to_string().contains("must have the same length"));
+        }
     }
 
     #[test]

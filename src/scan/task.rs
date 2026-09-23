@@ -23,8 +23,9 @@ use typed_builder::TypedBuilder;
 use crate::expr::BoundPredicate;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, ManifestEntryRef, NameMapping,
-    PartitionSpec, Schema, SchemaRef, Struct, StructType,
+    PartitionSpec, Schema, SchemaRef, SortOrderRef, Struct, StructType,
 };
+use crate::{Error, ErrorKind, Result};
 
 /// One maintenance planning result that retains the source manifest data file.
 /// Ordinary query planning does not construct this wrapper.
@@ -152,6 +153,18 @@ pub struct FileScanTask {
     #[builder(default)]
     pub unified_partition_type: Option<Arc<StructType>>,
 
+    /// Raw sort order id recorded on the data file.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub sort_order_id: Option<i32>,
+
+    /// Resolved non-empty sort order for this data file, when available.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[builder(default)]
+    pub sort_order: Option<SortOrderRef>,
+
     /// Name mapping from table metadata (property: schema.name-mapping.default),
     /// used to resolve field IDs from column names when Parquet files lack field IDs
     /// or have field ID conflicts.
@@ -180,6 +193,49 @@ pub struct FileScanTask {
 }
 
 impl FileScanTask {
+    /// Validate that partition values, partition spec, and scan schema form a
+    /// self-consistent task.
+    ///
+    /// This is deliberately separate from the builder so existing callers
+    /// that construct tasks directly remain source-compatible. Arrow readers
+    /// treat scan tasks as trusted execution plans and do not call this method
+    /// on the read hot path. Direct constructors must uphold the task
+    /// invariants and should call this method when their input is not already
+    /// trusted.
+    pub fn validate(&self) -> Result<()> {
+        match (self.partition.as_ref(), self.partition_spec.as_deref()) {
+            (None, None) => Ok(()),
+            (None, Some(partition_spec)) if partition_spec.is_unpartitioned() => {
+                Ok(())
+            }
+            (None, Some(_)) => Err(Error::new(
+                ErrorKind::DataInvalid,
+                "FileScanTask with a partitioned spec requires partition values",
+            )),
+            (Some(partition), None) if partition.fields().is_empty() => Ok(()),
+            (Some(_), None) => Err(Error::new(
+                ErrorKind::DataInvalid,
+                "Non-empty FileScanTask partition requires a partition spec",
+            )),
+            (Some(partition), Some(partition_spec))
+                if partition.fields().len() != partition_spec.fields().len() =>
+            {
+                Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "FileScanTask partition has {} fields but partition spec has {} fields",
+                        partition.fields().len(),
+                        partition_spec.fields().len()
+                    ),
+                ))
+            }
+            (Some(_), Some(partition_spec)) => {
+                partition_spec.partition_type(&self.schema)?;
+                Ok(())
+            }
+        }
+    }
+
     /// Returns whether this task reads the entire data file.
     ///
     /// Manifest-planned tasks use the canonical range
@@ -229,6 +285,16 @@ impl FileScanTask {
     /// Returns the partition spec id for this file scan task.
     pub fn partition_spec_id(&self) -> i32 {
         self.partition_spec_id
+    }
+
+    /// Returns the raw sort order id recorded on the data file.
+    pub fn sort_order_id(&self) -> Option<i32> {
+        self.sort_order_id
+    }
+
+    /// Returns the resolved non-empty sort order, when available.
+    pub fn sort_order(&self) -> Option<&SortOrderRef> {
+        self.sort_order.as_ref()
     }
 }
 
@@ -355,5 +421,78 @@ impl FileScanTaskDeleteFile {
     pub fn can_remove_after_dv_rewrite(&self) -> bool {
         self.is_deletion_vector()
             || (self.is_position_delete() && self.referenced_data_file.is_some())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::spec::{Literal, NestedField, PrimitiveType, Transform, Type};
+
+    fn task(
+        schema: SchemaRef,
+        partition: Option<Struct>,
+        partition_spec: Option<Arc<PartitionSpec>>,
+    ) -> FileScanTask {
+        FileScanTask::builder()
+            .with_file_size_in_bytes(100)
+            .with_start(0)
+            .with_length(100)
+            .with_data_file_path("data.parquet".to_owned())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema)
+            .with_project_field_ids(Vec::new())
+            .with_partition(partition)
+            .with_partition_spec(partition_spec)
+            .with_case_sensitive(true)
+            .build()
+    }
+
+    #[test]
+    fn validates_partition_shape_without_breaking_direct_construction() {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![Arc::new(NestedField::required(
+                    1,
+                    "x",
+                    Type::Primitive(PrimitiveType::Long),
+                ))])
+                .build()
+                .unwrap(),
+        );
+        let spec = Arc::new(
+            PartitionSpec::builder(schema.clone())
+                .add_partition_field("x", "x", Transform::Identity)
+                .unwrap()
+                .build()
+                .unwrap(),
+        );
+
+        task(
+            schema.clone(),
+            Some(Struct::from_iter([Some(Literal::long(7))])),
+            Some(spec.clone()),
+        )
+        .validate()
+        .unwrap();
+
+        let error = task(schema, Some(Struct::empty()), Some(spec))
+            .validate()
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
+        assert!(error.message().contains("partition has 0 fields"));
+    }
+
+    #[test]
+    fn rejects_non_empty_partition_without_spec() {
+        let schema = Arc::new(Schema::builder().build().unwrap());
+        let error = task(
+            schema,
+            Some(Struct::from_iter([Some(Literal::long(7))])),
+            None,
+        )
+        .validate()
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
     }
 }

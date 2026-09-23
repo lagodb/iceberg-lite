@@ -174,7 +174,9 @@ mod _serde {
             if version != V1 {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
-                    format!("Cannot resolve schema for version: {version}"),
+                    format!(
+                        "Unsupported key metadata version: {version} (supported: {V1})"
+                    ),
                 ));
             }
 

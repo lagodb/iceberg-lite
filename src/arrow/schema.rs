@@ -201,6 +201,7 @@ fn visit_type<V: ArrowSchemaVisitor>(
                     | DataType::Utf8
                     | DataType::LargeUtf8
                     | DataType::Utf8View
+                    | DataType::Null
                     | DataType::Binary
                     | DataType::LargeBinary
                     | DataType::BinaryView
@@ -535,6 +536,7 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
 
     fn primitive(&mut self, p: &DataType) -> Result<Self::T> {
         match p {
+            DataType::Null => Ok(Type::Primitive(PrimitiveType::Unknown)),
             DataType::Boolean => Ok(Type::Primitive(PrimitiveType::Boolean)),
             DataType::Int8 | DataType::Int16 | DataType::Int32 => {
                 Ok(Type::Primitive(PrimitiveType::Int))
@@ -730,6 +732,9 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         p: &crate::spec::PrimitiveType,
     ) -> crate::Result<ArrowSchemaOrFieldOrType> {
         match p {
+            crate::spec::PrimitiveType::Unknown => {
+                Ok(ArrowSchemaOrFieldOrType::Type(DataType::Null))
+            }
             crate::spec::PrimitiveType::Boolean => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::Boolean))
             }
@@ -1299,6 +1304,7 @@ pub(crate) fn primitive_type_to_arrow_type_with_ree(
     };
 
     match primitive_type {
+        PrimitiveType::Unknown => make_ree(DataType::Null),
         PrimitiveType::Boolean => make_ree(DataType::Boolean),
         PrimitiveType::Int => make_ree(DataType::Int32),
         PrimitiveType::Long => make_ree(DataType::Int64),

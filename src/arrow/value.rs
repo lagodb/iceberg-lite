@@ -24,7 +24,7 @@ use arrow_array::{
     MapArray, StringArray, StructArray, Time64MicrosecondArray,
     TimestampMicrosecondArray, TimestampNanosecondArray,
 };
-use arrow_buffer::NullBuffer;
+use arrow_buffer::{BooleanBuffer, NullBuffer};
 use arrow_schema::{DataType, FieldRef, TimeUnit};
 use uuid::Uuid;
 
@@ -219,6 +219,7 @@ impl SchemaWithPartnerVisitor<ArrayRef> for ArrowArrayToIcebergStructConverter {
         partner: &ArrayRef,
     ) -> Result<Vec<Option<Literal>>> {
         match p {
+            PrimitiveType::Unknown => Ok(vec![None; partner.len()]),
             PrimitiveType::Boolean => {
                 let array = partner
                     .as_any()
@@ -710,6 +711,7 @@ pub(crate) fn create_primitive_array_single_element(
     prim_lit: &Option<PrimitiveLiteral>,
 ) -> Result<ArrayRef> {
     match (data_type, prim_lit) {
+        (DataType::Null, None) => Ok(Arc::new(arrow_array::NullArray::new(1))),
         (DataType::Boolean, Some(PrimitiveLiteral::Boolean(v))) => {
             Ok(Arc::new(BooleanArray::from(vec![*v])))
         }
@@ -945,7 +947,12 @@ pub(crate) fn create_primitive_array_repeated(
 ) -> Result<ArrayRef> {
     Ok(match (data_type, prim_lit) {
         (DataType::Boolean, Some(PrimitiveLiteral::Boolean(value))) => {
-            Arc::new(BooleanArray::from(vec![*value; num_rows]))
+            let buffer = if *value {
+                BooleanBuffer::new_set(num_rows)
+            } else {
+                BooleanBuffer::new_unset(num_rows)
+            };
+            Arc::new(BooleanArray::new(buffer, None))
         }
         (DataType::Boolean, None) => {
             let vals: Vec<Option<bool>> = vec![None; num_rows];
@@ -1026,19 +1033,47 @@ pub(crate) fn create_primitive_array_repeated(
             let vals: Vec<Option<f64>> = vec![None; num_rows];
             Arc::new(Float64Array::from(vals))
         }
-        (DataType::Utf8, Some(PrimitiveLiteral::String(value))) => {
-            Arc::new(StringArray::from(vec![value.clone(); num_rows]))
-        }
+        (DataType::Utf8, Some(PrimitiveLiteral::String(value))) => Arc::new(
+            StringArray::from_iter_values(std::iter::repeat_n(value.as_str(), num_rows)),
+        ),
         (DataType::Utf8, None) => {
             let vals: Vec<Option<String>> = vec![None; num_rows];
             Arc::new(StringArray::from(vals))
         }
-        (DataType::Binary, Some(PrimitiveLiteral::Binary(value))) => {
-            Arc::new(BinaryArray::from_vec(vec![value; num_rows]))
-        }
+        (DataType::Binary, Some(PrimitiveLiteral::Binary(value))) => Arc::new(
+            BinaryArray::from_iter_values(std::iter::repeat_n(value.as_slice(), num_rows)),
+        ),
         (DataType::Binary, None) => {
             let vals: Vec<Option<&[u8]>> = vec![None; num_rows];
             Arc::new(BinaryArray::from_opt_vec(vals))
+        }
+        (DataType::LargeBinary, Some(PrimitiveLiteral::Binary(value))) => Arc::new(
+            LargeBinaryArray::from_iter_values(std::iter::repeat_n(value.as_slice(), num_rows)),
+        ),
+        (DataType::LargeBinary, None) => {
+            let vals: Vec<Option<&[u8]>> = vec![None; num_rows];
+            Arc::new(LargeBinaryArray::from_opt_vec(vals))
+        }
+        (DataType::FixedSizeBinary(len), Some(PrimitiveLiteral::Binary(value))) => {
+            if value.len() != *len as usize {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "FixedSizeBinary literal length {} does not match declared width {len}",
+                        value.len()
+                    ),
+                ));
+            }
+
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(std::iter::repeat_n(value.as_slice(), num_rows))
+                    .map_err(|e| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Failed to create FixedSizeBinary({len}) array: {e}"),
+                        )
+                    })?,
+            )
         }
         (DataType::Decimal128(precision, scale), Some(PrimitiveLiteral::Int128(value))) => {
             Arc::new(
@@ -1096,7 +1131,7 @@ pub(crate) fn create_primitive_array_repeated(
                 Some(NullBuffer::new_null(num_rows)),
             ))
         }
-        (DataType::Null, _) => Arc::new(arrow_array::NullArray::new(num_rows)),
+        (DataType::Null, None) => Arc::new(arrow_array::NullArray::new(num_rows)),
         (dt, _) => {
             return Err(Error::new(
                 ErrorKind::Unexpected,
@@ -2179,5 +2214,44 @@ mod test {
 
         assert_eq!(array.data_type(), &target_type);
         assert_eq!(array.len(), num_rows);
+    }
+
+    #[test]
+    fn test_create_boolean_array_repeated() {
+        for value in [true, false] {
+            let literal = Some(PrimitiveLiteral::Boolean(value));
+            let array =
+                create_primitive_array_repeated(&DataType::Boolean, &literal, 4)
+                    .unwrap();
+            let array = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            assert_eq!(array.len(), 4);
+            assert!((0..4).all(|index| array.value(index) == value));
+        }
+    }
+
+    #[test]
+    fn test_create_string_and_binary_arrays_repeated() {
+        let string = Some(PrimitiveLiteral::String("iceberg".to_owned()));
+        let array =
+            create_primitive_array_repeated(&DataType::Utf8, &string, 3).unwrap();
+        let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+        assert_eq!(array.iter().collect::<Vec<_>>(), vec![Some("iceberg"); 3]);
+
+        let binary = Some(PrimitiveLiteral::Binary(vec![1, 2, 3]));
+        let array =
+            create_primitive_array_repeated(&DataType::Binary, &binary, 3).unwrap();
+        let array = array.as_any().downcast_ref::<BinaryArray>().unwrap();
+        assert_eq!(
+            array.iter().collect::<Vec<_>>(),
+            vec![Some([1_u8, 2, 3].as_slice()); 3]
+        );
+
+        let error = create_primitive_array_repeated(
+            &DataType::FixedSizeBinary(4),
+            &binary,
+            1,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::DataInvalid);
     }
 }

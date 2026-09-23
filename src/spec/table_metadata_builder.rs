@@ -1201,7 +1201,7 @@ impl TableMetadataBuilder {
         if let Some(hist_entry) = self.previous_history_entry.take() {
             self.metadata.metadata_log.push(hist_entry);
         }
-        let expired_metadata_logs = self.expire_metadata_log();
+        let expired_metadata_logs = self.expire_metadata_log()?;
 
         Ok(TableMetadataBuildResult {
             metadata: self.metadata,
@@ -1210,24 +1210,21 @@ impl TableMetadataBuilder {
         })
     }
 
-    fn expire_metadata_log(&mut self) -> Vec<MetadataLog> {
+    fn expire_metadata_log(&mut self) -> Result<Vec<MetadataLog>> {
         let max_size = self
             .metadata
-            .properties
-            .get(TableProperties::PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX)
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(
-                TableProperties::PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX_DEFAULT,
-            )
+            .table_properties()
+            .metadata_previous_versions_max()?
             .max(1);
 
         if self.metadata.metadata_log.len() > max_size {
-            self.metadata
+            Ok(self
+                .metadata
                 .metadata_log
                 .drain(0..self.metadata.metadata_log.len() - max_size)
-                .collect()
+                .collect())
         } else {
-            Vec::new()
+            Ok(Vec::new())
         }
     }
 

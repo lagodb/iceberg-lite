@@ -20,6 +20,7 @@ use std::fmt::Display;
 use std::str::FromStr;
 
 use crate::compression::CompressionCodec;
+use crate::spec::NameMapping;
 use crate::util::location::strip_trailing_slash;
 use crate::{Error, ErrorKind, Result};
 
@@ -110,7 +111,7 @@ where
 }
 
 /// Parse compression codec for metadata files from table properties.
-pub(crate) fn parse_metadata_file_compression(
+fn parse_metadata_file_compression(
     properties: &HashMap<String, String>,
 ) -> Result<CompressionCodec> {
     let value = properties
@@ -222,82 +223,21 @@ fn parse_location_property(
         .transpose()
 }
 
-/// TableProperties that contains the properties of a table.
-#[derive(Debug)]
-pub struct TableProperties {
-    /// The number of times to retry a commit.
-    pub commit_num_retries: usize,
-    /// The minimum wait time between retries.
-    pub commit_min_retry_wait_ms: u64,
-    /// The maximum wait time between retries.
-    pub commit_max_retry_wait_ms: u64,
-    /// The total timeout for commit retries.
-    pub commit_total_retry_timeout_ms: u64,
-    /// The default format for files.
-    pub write_format_default: String,
-    /// The target file size for files.
-    pub write_target_file_size_bytes: usize,
-    /// Base directory for metadata files.
-    pub write_metadata_path: Option<String>,
-    pub metadata_previous_versions_max: usize,
-    /// Minimum live manifest count before automatic merging.
-    pub manifest_min_count_to_merge: usize,
-    /// Target size for rewritten manifest files.
-    pub manifest_target_size_bytes: u64,
-    pub manifest_merge_enabled: bool,
-    /// Compression codec for metadata files.
-    pub metadata_compression_codec: CompressionCodec,
-    /// Whether to use `FanoutWriter` for partitioned tables.
-    pub write_datafusion_fanout_enabled: bool,
-    /// Whether content-defined chunking is enabled.
-    /// `true` only when `write.parquet.content-defined-chunking.enabled = "true"`.
-    pub cdc_enabled: bool,
-    /// Content-defined chunking minimum chunk size in bytes.
-    pub cdc_min_chunk_size: usize,
-    /// Content-defined chunking maximum chunk size in bytes.
-    pub cdc_max_chunk_size: usize,
-    /// Content-defined chunking normalization level.
-    pub cdc_norm_level: i32,
-    /// Compression codec and resolved level for Parquet data files.
-    pub parquet_compression_codec: CompressionCodec,
-    /// Approximate maximum Parquet row group size in bytes.
-    pub parquet_row_group_size_bytes: usize,
-    /// Approximate maximum Parquet data page size in bytes.
-    pub parquet_page_size_bytes: usize,
-    /// Maximum number of rows per Parquet data page.
-    pub parquet_page_row_limit: usize,
-    /// Approximate maximum Parquet dictionary page size in bytes.
-    pub parquet_dict_size_bytes: usize,
-    /// Base directory for data files.
-    pub write_data_location: Option<String>,
-    /// Deprecated fallback base directory for data files.
-    pub write_folder_storage_location: Option<String>,
-    /// Deprecated fallback base directory for object-storage layout.
-    pub write_object_storage_location: Option<String>,
-    /// Whether object-storage paths include partition values.
-    pub write_object_storage_partitioned_paths: bool,
-    /// Whether garbage collection is enabled.
-    /// When `false`, maintenance actions must not remove metadata references.
-    pub gc_enabled: bool,
-    /// Default maximum age of a snapshot to keep when expiring snapshots.
-    pub max_snapshot_age_ms: i64,
-    /// Default minimum number of snapshots to keep per branch when expiring snapshots.
-    pub min_snapshots_to_keep: usize,
-    /// Default maximum age of a snapshot reference to keep when expiring snapshots.
-    pub max_ref_age_ms: i64,
-    /// The master key id used to encrypt this table's manifest list and data files.
-    pub encryption_key_id: Option<String>,
-    /// The encryption data encryption key length in bytes.
-    pub encryption_data_key_length: usize,
-    /// Isolation level for SQL DELETE validation.
-    pub write_delete_isolation_level: IsolationLevel,
-    /// Isolation level for SQL UPDATE validation.
-    pub write_update_isolation_level: IsolationLevel,
-    /// Isolation level for SQL MERGE validation.
-    pub write_merge_isolation_level: IsolationLevel,
+/// A borrowed, lazily parsed view of a table's raw properties.
+///
+/// Each getter parses only the property it consumes. An invalid unrelated
+/// property therefore does not prevent other table operations from proceeding.
+#[derive(Debug, Clone, Copy)]
+pub struct TableProperties<'a> {
+    properties: &'a HashMap<String, String>,
 }
 
-impl TableProperties {
+impl<'a> TableProperties<'a> {
+    /// Creates a lazy view over raw table properties.
+    pub const fn new(properties: &'a HashMap<String, String>) -> Self {
+        Self { properties }
+    }
+
     /// Reserved table property for table format version.
     ///
     /// Iceberg will default a new table's format version to the latest stable and recommended
@@ -307,36 +247,38 @@ impl TableProperties {
     /// If this table property exists when creating a table, the table will use the specified format
     /// version. If a table updates this property, it will try to upgrade to the specified format
     /// version.
-    pub const PROPERTY_FORMAT_VERSION: &str = "format-version";
+    pub const PROPERTY_FORMAT_VERSION: &'static str = "format-version";
     /// Reserved table property for table UUID.
-    pub const PROPERTY_UUID: &str = "uuid";
+    pub const PROPERTY_UUID: &'static str = "uuid";
     /// Reserved table property for the total number of snapshots.
-    pub const PROPERTY_SNAPSHOT_COUNT: &str = "snapshot-count";
+    pub const PROPERTY_SNAPSHOT_COUNT: &'static str = "snapshot-count";
     /// Reserved table property for current snapshot summary.
-    pub const PROPERTY_CURRENT_SNAPSHOT_SUMMARY: &str = "current-snapshot-summary";
+    pub const PROPERTY_CURRENT_SNAPSHOT_SUMMARY: &'static str =
+        "current-snapshot-summary";
     /// Reserved table property for current snapshot id.
-    pub const PROPERTY_CURRENT_SNAPSHOT_ID: &str = "current-snapshot-id";
+    pub const PROPERTY_CURRENT_SNAPSHOT_ID: &'static str = "current-snapshot-id";
     /// Reserved table property for current snapshot timestamp.
-    pub const PROPERTY_CURRENT_SNAPSHOT_TIMESTAMP: &str =
+    pub const PROPERTY_CURRENT_SNAPSHOT_TIMESTAMP: &'static str =
         "current-snapshot-timestamp-ms";
     /// Reserved table property for the JSON representation of current schema.
-    pub const PROPERTY_CURRENT_SCHEMA: &str = "current-schema";
+    pub const PROPERTY_CURRENT_SCHEMA: &'static str = "current-schema";
     /// Reserved table property for the JSON representation of current(default) partition spec.
-    pub const PROPERTY_DEFAULT_PARTITION_SPEC: &str = "default-partition-spec";
+    pub const PROPERTY_DEFAULT_PARTITION_SPEC: &'static str =
+        "default-partition-spec";
     /// Reserved table property for the JSON representation of current(default) sort order.
-    pub const PROPERTY_DEFAULT_SORT_ORDER: &str = "default-sort-order";
+    pub const PROPERTY_DEFAULT_SORT_ORDER: &'static str = "default-sort-order";
 
     /// Property key for max number of previous versions to keep.
-    pub const PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX: &str =
+    pub const PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX: &'static str =
         "write.metadata.previous-versions-max";
     /// Default value for max number of previous versions to keep.
     pub const PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX_DEFAULT: usize = 100;
-    pub const PROPERTY_METADATA_DELETE_AFTER_COMMIT_ENABLED: &str =
+    pub const PROPERTY_METADATA_DELETE_AFTER_COMMIT_ENABLED: &'static str =
         "write.metadata.delete-after-commit.enabled";
     pub const PROPERTY_METADATA_DELETE_AFTER_COMMIT_ENABLED_DEFAULT: bool = false;
 
     /// Property key for max number of partitions to keep summary stats for.
-    pub const PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT: &str =
+    pub const PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT: &'static str =
         "write.summary.partition-limit";
     /// Default value for the max number of partitions to keep summary stats for.
     pub const PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT: u64 = 0;
@@ -345,7 +287,7 @@ impl TableProperties {
     ///
     /// Reserved table properties are only used to control behaviors when creating or updating a
     /// table. The value of these properties are not persisted as a part of the table metadata.
-    pub const RESERVED_PROPERTIES: [&str; 9] = [
+    pub const RESERVED_PROPERTIES: [&'static str; 9] = [
         Self::PROPERTY_FORMAT_VERSION,
         Self::PROPERTY_UUID,
         Self::PROPERTY_SNAPSHOT_COUNT,
@@ -358,321 +300,436 @@ impl TableProperties {
     ];
 
     /// Property key for number of commit retries.
-    pub const PROPERTY_COMMIT_NUM_RETRIES: &str = "commit.retry.num-retries";
+    pub const PROPERTY_COMMIT_NUM_RETRIES: &'static str = "commit.retry.num-retries";
     /// Default value for number of commit retries.
     pub const PROPERTY_COMMIT_NUM_RETRIES_DEFAULT: usize = 4;
 
     /// Property key for minimum wait time (ms) between retries.
-    pub const PROPERTY_COMMIT_MIN_RETRY_WAIT_MS: &str = "commit.retry.min-wait-ms";
+    pub const PROPERTY_COMMIT_MIN_RETRY_WAIT_MS: &'static str =
+        "commit.retry.min-wait-ms";
     /// Default value for minimum wait time (ms) between retries.
     pub const PROPERTY_COMMIT_MIN_RETRY_WAIT_MS_DEFAULT: u64 = 100;
 
     /// Property key for maximum wait time (ms) between retries.
-    pub const PROPERTY_COMMIT_MAX_RETRY_WAIT_MS: &str = "commit.retry.max-wait-ms";
+    pub const PROPERTY_COMMIT_MAX_RETRY_WAIT_MS: &'static str =
+        "commit.retry.max-wait-ms";
     /// Default value for maximum wait time (ms) between retries.
     pub const PROPERTY_COMMIT_MAX_RETRY_WAIT_MS_DEFAULT: u64 = 60 * 1000; // 1 minute
 
     /// Property key for total maximum retry time (ms).
-    pub const PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS: &str =
+    pub const PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS: &'static str =
         "commit.retry.total-timeout-ms";
     /// Default value for total maximum retry time (ms).
     pub const PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT: u64 = 30 * 60 * 1000; // 30 minutes
 
     /// Default file format for data files
-    pub const PROPERTY_DEFAULT_FILE_FORMAT: &str = "write.format.default";
+    pub const PROPERTY_DEFAULT_FILE_FORMAT: &'static str = "write.format.default";
     /// Default file format for delete files
-    pub const PROPERTY_DELETE_DEFAULT_FILE_FORMAT: &str =
+    pub const PROPERTY_DELETE_DEFAULT_FILE_FORMAT: &'static str =
         "write.delete.format.default";
     /// Default value for data file format
-    pub const PROPERTY_DEFAULT_FILE_FORMAT_DEFAULT: &str = "parquet";
+    pub const PROPERTY_DEFAULT_FILE_FORMAT_DEFAULT: &'static str = "parquet";
 
     /// Property key for delete command isolation level.
-    pub const PROPERTY_WRITE_DELETE_ISOLATION_LEVEL: &str =
+    pub const PROPERTY_WRITE_DELETE_ISOLATION_LEVEL: &'static str =
         "write.delete.isolation-level";
     /// Property key for update command isolation level.
-    pub const PROPERTY_WRITE_UPDATE_ISOLATION_LEVEL: &str =
+    pub const PROPERTY_WRITE_UPDATE_ISOLATION_LEVEL: &'static str =
         "write.update.isolation-level";
     /// Property key for merge command isolation level.
-    pub const PROPERTY_WRITE_MERGE_ISOLATION_LEVEL: &str =
+    pub const PROPERTY_WRITE_MERGE_ISOLATION_LEVEL: &'static str =
         "write.merge.isolation-level";
     /// Default write isolation level.
     pub const PROPERTY_WRITE_ISOLATION_LEVEL_DEFAULT: IsolationLevel =
         IsolationLevel::Serializable;
 
     /// Target file size for newly written files.
-    pub const PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES: &str =
+    pub const PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES: &'static str =
         "write.target-file-size-bytes";
     /// Default target file size
     pub const PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT: usize =
         512 * 1024 * 1024; // 512 MB
-    pub const PROPERTY_WRITE_METADATA_PATH: &str = "write.metadata.path";
+    pub const PROPERTY_WRITE_METADATA_PATH: &'static str = "write.metadata.path";
     /// Minimum live manifest count before automatic merging is considered.
-    pub const PROPERTY_MANIFEST_MIN_COUNT_TO_MERGE: &str =
+    pub const PROPERTY_MANIFEST_MIN_COUNT_TO_MERGE: &'static str =
         "commit.manifest.min-count-to-merge";
     pub const PROPERTY_MANIFEST_MIN_COUNT_TO_MERGE_DEFAULT: usize = 100;
     /// Target size for rewritten manifest files.
-    pub const PROPERTY_MANIFEST_TARGET_SIZE_BYTES: &str =
+    pub const PROPERTY_MANIFEST_TARGET_SIZE_BYTES: &'static str =
         "commit.manifest.target-size-bytes";
     pub const PROPERTY_MANIFEST_TARGET_SIZE_BYTES_DEFAULT: u64 = 8 * 1024 * 1024;
-    pub const PROPERTY_MANIFEST_MERGE_ENABLED: &str = "commit.manifest-merge.enabled";
+    pub const PROPERTY_MANIFEST_MERGE_ENABLED: &'static str =
+        "commit.manifest-merge.enabled";
     pub const PROPERTY_MANIFEST_MERGE_ENABLED_DEFAULT: bool = true;
     /// Compression codec for metadata files.
-    pub const PROPERTY_METADATA_COMPRESSION_CODEC: &str =
+    pub const PROPERTY_METADATA_COMPRESSION_CODEC: &'static str =
         "write.metadata.compression-codec";
     /// Default metadata compression codec.
-    pub const PROPERTY_METADATA_COMPRESSION_CODEC_DEFAULT: &str = "none";
+    pub const PROPERTY_METADATA_COMPRESSION_CODEC_DEFAULT: &'static str = "none";
     /// Whether to use `FanoutWriter` for partitioned tables.
-    pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED: &str =
+    pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED: &'static str =
         "write.datafusion.fanout.enabled";
     /// Default value for fanout writer enabled.
     pub const PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT: bool = true;
 
     /// Enable content-defined chunking with parquet defaults or per-property overrides.
-    pub const PROPERTY_PARQUET_CDC_ENABLED: &str =
+    pub const PROPERTY_PARQUET_CDC_ENABLED: &'static str =
         "write.parquet.content-defined-chunking.enabled";
     /// Default value for content-defined chunking enabled.
     pub const PROPERTY_PARQUET_CDC_ENABLED_DEFAULT: bool = false;
     /// Minimum chunk size in bytes for content-defined chunking.
-    pub const PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE: &str =
+    pub const PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE: &'static str =
         "write.parquet.content-defined-chunking.min-chunk-size";
     /// Default matches `parquet::file::properties::DEFAULT_CDC_MIN_CHUNK_SIZE`.
     pub const PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE_DEFAULT: usize = 256 * 1024;
     /// Maximum chunk size in bytes for content-defined chunking.
-    pub const PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE: &str =
+    pub const PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE: &'static str =
         "write.parquet.content-defined-chunking.max-chunk-size";
     /// Default matches `parquet::file::properties::DEFAULT_CDC_MAX_CHUNK_SIZE`.
     pub const PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE_DEFAULT: usize = 1024 * 1024;
     /// Normalization level for content-defined chunking.
-    pub const PROPERTY_PARQUET_CDC_NORM_LEVEL: &str =
+    pub const PROPERTY_PARQUET_CDC_NORM_LEVEL: &'static str =
         "write.parquet.content-defined-chunking.norm-level";
     /// Default matches `parquet::file::properties::DEFAULT_CDC_NORM_LEVEL`.
     pub const PROPERTY_PARQUET_CDC_NORM_LEVEL_DEFAULT: i32 = 0;
 
-    pub const PROPERTY_PARQUET_COMPRESSION_CODEC: &str =
+    pub const PROPERTY_PARQUET_COMPRESSION_CODEC: &'static str =
         "write.parquet.compression-codec";
-    pub const PROPERTY_PARQUET_COMPRESSION_CODEC_DEFAULT: &str = "zstd";
-    pub const PROPERTY_PARQUET_COMPRESSION_LEVEL: &str =
+    pub const PROPERTY_PARQUET_COMPRESSION_CODEC_DEFAULT: &'static str = "zstd";
+    pub const PROPERTY_PARQUET_COMPRESSION_LEVEL: &'static str =
         "write.parquet.compression-level";
-    pub const PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES: &str =
+    pub const PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES: &'static str =
         "write.parquet.row-group-size-bytes";
     pub const PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES_DEFAULT: usize =
         128 * 1024 * 1024;
-    pub const PROPERTY_PARQUET_PAGE_SIZE_BYTES: &str =
+    pub const PROPERTY_PARQUET_PAGE_SIZE_BYTES: &'static str =
         "write.parquet.page-size-bytes";
     pub const PROPERTY_PARQUET_PAGE_SIZE_BYTES_DEFAULT: usize = 1024 * 1024;
-    pub const PROPERTY_PARQUET_PAGE_ROW_LIMIT: &str = "write.parquet.page-row-limit";
+    pub const PROPERTY_PARQUET_PAGE_ROW_LIMIT: &'static str =
+        "write.parquet.page-row-limit";
     pub const PROPERTY_PARQUET_PAGE_ROW_LIMIT_DEFAULT: usize = 20_000;
-    pub const PROPERTY_PARQUET_DICT_SIZE_BYTES: &str =
+    pub const PROPERTY_PARQUET_DICT_SIZE_BYTES: &'static str =
         "write.parquet.dict-size-bytes";
     pub const PROPERTY_PARQUET_DICT_SIZE_BYTES_DEFAULT: usize = 2 * 1024 * 1024;
 
-    pub const PROPERTY_WRITE_DATA_LOCATION: &str = "write.data.path";
-    pub const PROPERTY_WRITE_FOLDER_STORAGE_LOCATION: &str =
+    pub const PROPERTY_WRITE_DATA_LOCATION: &'static str = "write.data.path";
+    pub const PROPERTY_WRITE_FOLDER_STORAGE_LOCATION: &'static str =
         "write.folder-storage.path";
-    pub const PROPERTY_WRITE_OBJECT_STORAGE_LOCATION: &str =
+    pub const PROPERTY_WRITE_OBJECT_STORAGE_LOCATION: &'static str =
         "write.object-storage.path";
-    pub const PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS: &str =
+    pub const PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS: &'static str =
         "write.object-storage.partitioned-paths";
     pub const PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS_DEFAULT: bool = true;
 
     /// Property key for enabling garbage collection.
     /// Defaults to `true`.
-    pub const PROPERTY_GC_ENABLED: &str = "gc.enabled";
+    pub const PROPERTY_GC_ENABLED: &'static str = "gc.enabled";
     /// Default value for gc.enabled.
     pub const PROPERTY_GC_ENABLED_DEFAULT: bool = true;
 
     /// Property key for the default maximum age of a snapshot to keep when expiring snapshots.
-    pub const PROPERTY_MAX_SNAPSHOT_AGE_MS: &str =
+    pub const PROPERTY_MAX_SNAPSHOT_AGE_MS: &'static str =
         "history.expire.max-snapshot-age-ms";
     /// Default value for history.expire.max-snapshot-age-ms (5 days).
     pub const PROPERTY_MAX_SNAPSHOT_AGE_MS_DEFAULT: i64 = 5 * 24 * 60 * 60 * 1000;
     /// Property key for the default minimum number of snapshots to keep when expiring snapshots.
-    pub const PROPERTY_MIN_SNAPSHOTS_TO_KEEP: &str =
+    pub const PROPERTY_MIN_SNAPSHOTS_TO_KEEP: &'static str =
         "history.expire.min-snapshots-to-keep";
     /// Default value for history.expire.min-snapshots-to-keep.
     pub const PROPERTY_MIN_SNAPSHOTS_TO_KEEP_DEFAULT: usize = 1;
     /// Property key for the default maximum age of a snapshot reference to keep when expiring.
-    pub const PROPERTY_MAX_REF_AGE_MS: &str = "history.expire.max-ref-age-ms";
+    pub const PROPERTY_MAX_REF_AGE_MS: &'static str = "history.expire.max-ref-age-ms";
     /// Default value for history.expire.max-ref-age-ms (effectively never expire refs).
     pub const PROPERTY_MAX_REF_AGE_MS_DEFAULT: i64 = i64::MAX;
 
+    /// Property key for the default schema name mapping.
+    pub const PROPERTY_DEFAULT_NAME_MAPPING: &'static str =
+        "schema.name-mapping.default";
+
     /// Property key for the master key id used to encrypt the table's manifest list and data files.
-    pub const PROPERTY_ENCRYPTION_KEY_ID: &str = "encryption.key-id";
+    pub const PROPERTY_ENCRYPTION_KEY_ID: &'static str = "encryption.key-id";
     /// Property key for the encryption data encryption key (DEK) length in bytes.
-    pub const PROPERTY_ENCRYPTION_DATA_KEY_LENGTH: &str =
+    pub const PROPERTY_ENCRYPTION_DATA_KEY_LENGTH: &'static str =
         "encryption.data-key-length";
     /// Default value for the encryption DEK length (16 bytes = AES-128).
     pub const PROPERTY_ENCRYPTION_DATA_KEY_LENGTH_DEFAULT: usize = 16;
-}
 
-impl TryFrom<&HashMap<String, String>> for TableProperties {
-    // parse by entry key or use default value
-    type Error = Error;
+    pub fn commit_num_retries(&self) -> Result<usize> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_COMMIT_NUM_RETRIES,
+            Self::PROPERTY_COMMIT_NUM_RETRIES_DEFAULT,
+        )
+    }
 
-    fn try_from(props: &HashMap<String, String>) -> Result<Self> {
-        Ok(TableProperties {
-            commit_num_retries: parse_property(
-                props,
-                TableProperties::PROPERTY_COMMIT_NUM_RETRIES,
-                TableProperties::PROPERTY_COMMIT_NUM_RETRIES_DEFAULT,
-            )?,
-            commit_min_retry_wait_ms: parse_property(
-                props,
-                TableProperties::PROPERTY_COMMIT_MIN_RETRY_WAIT_MS,
-                TableProperties::PROPERTY_COMMIT_MIN_RETRY_WAIT_MS_DEFAULT,
-            )?,
-            commit_max_retry_wait_ms: parse_property(
-                props,
-                TableProperties::PROPERTY_COMMIT_MAX_RETRY_WAIT_MS,
-                TableProperties::PROPERTY_COMMIT_MAX_RETRY_WAIT_MS_DEFAULT,
-            )?,
-            commit_total_retry_timeout_ms: parse_property(
-                props,
-                TableProperties::PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS,
-                TableProperties::PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT,
-            )?,
-            write_format_default: parse_property(
-                props,
-                TableProperties::PROPERTY_DEFAULT_FILE_FORMAT,
-                TableProperties::PROPERTY_DEFAULT_FILE_FORMAT_DEFAULT.to_string(),
-            )?,
-            write_target_file_size_bytes: parse_property(
-                props,
-                TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES,
-                TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT,
-            )?,
-            write_metadata_path: parse_location_property(
-                props,
-                TableProperties::PROPERTY_WRITE_METADATA_PATH,
-            )?,
-            metadata_previous_versions_max: parse_property(
-                props,
-                TableProperties::PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX,
-                TableProperties::PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX_DEFAULT,
-            )?,
-            manifest_min_count_to_merge: parse_property(
-                props,
-                TableProperties::PROPERTY_MANIFEST_MIN_COUNT_TO_MERGE,
-                TableProperties::PROPERTY_MANIFEST_MIN_COUNT_TO_MERGE_DEFAULT,
-            )?,
-            manifest_target_size_bytes: parse_property(
-                props,
-                TableProperties::PROPERTY_MANIFEST_TARGET_SIZE_BYTES,
-                TableProperties::PROPERTY_MANIFEST_TARGET_SIZE_BYTES_DEFAULT,
-            )?,
-            manifest_merge_enabled: parse_property(
-                props,
-                TableProperties::PROPERTY_MANIFEST_MERGE_ENABLED,
-                TableProperties::PROPERTY_MANIFEST_MERGE_ENABLED_DEFAULT,
-            )?,
-            metadata_compression_codec: parse_metadata_file_compression(props)?,
-            write_datafusion_fanout_enabled: parse_property(
-                props,
-                TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED,
-                TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT,
-            )?,
-            cdc_enabled: parse_property(
-                props,
-                TableProperties::PROPERTY_PARQUET_CDC_ENABLED,
-                TableProperties::PROPERTY_PARQUET_CDC_ENABLED_DEFAULT,
-            )?,
-            cdc_min_chunk_size: parse_property(
-                props,
-                TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE,
-                TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE_DEFAULT,
-            )?,
-            cdc_max_chunk_size: parse_property(
-                props,
-                TableProperties::PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE,
-                TableProperties::PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE_DEFAULT,
-            )?,
-            cdc_norm_level: parse_property(
-                props,
-                TableProperties::PROPERTY_PARQUET_CDC_NORM_LEVEL,
-                TableProperties::PROPERTY_PARQUET_CDC_NORM_LEVEL_DEFAULT,
-            )?,
-            parquet_compression_codec: parse_parquet_compression(props)?,
-            parquet_row_group_size_bytes: parse_property(
-                props,
-                TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES,
-                TableProperties::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES_DEFAULT,
-            )?,
-            parquet_page_size_bytes: parse_property(
-                props,
-                TableProperties::PROPERTY_PARQUET_PAGE_SIZE_BYTES,
-                TableProperties::PROPERTY_PARQUET_PAGE_SIZE_BYTES_DEFAULT,
-            )?,
-            parquet_page_row_limit: parse_property(
-                props,
-                TableProperties::PROPERTY_PARQUET_PAGE_ROW_LIMIT,
-                TableProperties::PROPERTY_PARQUET_PAGE_ROW_LIMIT_DEFAULT,
-            )?,
-            parquet_dict_size_bytes: parse_property(
-                props,
-                TableProperties::PROPERTY_PARQUET_DICT_SIZE_BYTES,
-                TableProperties::PROPERTY_PARQUET_DICT_SIZE_BYTES_DEFAULT,
-            )?,
-            write_data_location: parse_location_property(
-                props,
-                TableProperties::PROPERTY_WRITE_DATA_LOCATION,
-            )?,
-            write_folder_storage_location: parse_location_property(
-                props,
-                TableProperties::PROPERTY_WRITE_FOLDER_STORAGE_LOCATION,
-            )?,
-            write_object_storage_location: parse_location_property(
-                props,
-                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_LOCATION,
-            )?,
-            write_object_storage_partitioned_paths: parse_property_bool(
-                props,
-                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS,
-                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS_DEFAULT,
-            )?,
-            gc_enabled: parse_property(
-                props,
-                TableProperties::PROPERTY_GC_ENABLED,
-                TableProperties::PROPERTY_GC_ENABLED_DEFAULT,
-            )?,
-            max_snapshot_age_ms: parse_property(
-                props,
-                TableProperties::PROPERTY_MAX_SNAPSHOT_AGE_MS,
-                TableProperties::PROPERTY_MAX_SNAPSHOT_AGE_MS_DEFAULT,
-            )?,
-            min_snapshots_to_keep: parse_property(
-                props,
-                TableProperties::PROPERTY_MIN_SNAPSHOTS_TO_KEEP,
-                TableProperties::PROPERTY_MIN_SNAPSHOTS_TO_KEEP_DEFAULT,
-            )?,
-            max_ref_age_ms: parse_property(
-                props,
-                TableProperties::PROPERTY_MAX_REF_AGE_MS,
-                TableProperties::PROPERTY_MAX_REF_AGE_MS_DEFAULT,
-            )?,
-            encryption_key_id: props
-                .get(TableProperties::PROPERTY_ENCRYPTION_KEY_ID)
-                .cloned(),
-            encryption_data_key_length: parse_property(
-                props,
-                TableProperties::PROPERTY_ENCRYPTION_DATA_KEY_LENGTH,
-                TableProperties::PROPERTY_ENCRYPTION_DATA_KEY_LENGTH_DEFAULT,
-            )?,
-            write_delete_isolation_level: parse_property(
-                props,
-                TableProperties::PROPERTY_WRITE_DELETE_ISOLATION_LEVEL,
-                TableProperties::PROPERTY_WRITE_ISOLATION_LEVEL_DEFAULT,
-            )?,
-            write_update_isolation_level: parse_property(
-                props,
-                TableProperties::PROPERTY_WRITE_UPDATE_ISOLATION_LEVEL,
-                TableProperties::PROPERTY_WRITE_ISOLATION_LEVEL_DEFAULT,
-            )?,
-            write_merge_isolation_level: parse_property(
-                props,
-                TableProperties::PROPERTY_WRITE_MERGE_ISOLATION_LEVEL,
-                TableProperties::PROPERTY_WRITE_ISOLATION_LEVEL_DEFAULT,
-            )?,
-        })
+    pub fn commit_min_retry_wait_ms(&self) -> Result<u64> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_COMMIT_MIN_RETRY_WAIT_MS,
+            Self::PROPERTY_COMMIT_MIN_RETRY_WAIT_MS_DEFAULT,
+        )
+    }
+
+    pub fn commit_max_retry_wait_ms(&self) -> Result<u64> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_COMMIT_MAX_RETRY_WAIT_MS,
+            Self::PROPERTY_COMMIT_MAX_RETRY_WAIT_MS_DEFAULT,
+        )
+    }
+
+    pub fn commit_total_retry_timeout_ms(&self) -> Result<u64> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS,
+            Self::PROPERTY_COMMIT_TOTAL_RETRY_TIME_MS_DEFAULT,
+        )
+    }
+
+    pub fn write_format_default(&self) -> Result<String> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_DEFAULT_FILE_FORMAT,
+            Self::PROPERTY_DEFAULT_FILE_FORMAT_DEFAULT.to_string(),
+        )
+    }
+
+    pub fn write_target_file_size_bytes(&self) -> Result<usize> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES,
+            Self::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT,
+        )
+    }
+
+    pub fn write_metadata_path(&self) -> Result<Option<String>> {
+        parse_location_property(self.properties, Self::PROPERTY_WRITE_METADATA_PATH)
+    }
+
+    pub fn metadata_previous_versions_max(&self) -> Result<usize> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX,
+            Self::PROPERTY_METADATA_PREVIOUS_VERSIONS_MAX_DEFAULT,
+        )
+    }
+
+    pub fn metadata_delete_after_commit_enabled(&self) -> Result<bool> {
+        parse_property_bool(
+            self.properties,
+            Self::PROPERTY_METADATA_DELETE_AFTER_COMMIT_ENABLED,
+            Self::PROPERTY_METADATA_DELETE_AFTER_COMMIT_ENABLED_DEFAULT,
+        )
+    }
+
+    pub fn write_partition_summary_limit(&self) -> Result<u64> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT,
+            Self::PROPERTY_WRITE_PARTITION_SUMMARY_LIMIT_DEFAULT,
+        )
+    }
+
+    pub fn manifest_min_count_to_merge(&self) -> Result<usize> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_MANIFEST_MIN_COUNT_TO_MERGE,
+            Self::PROPERTY_MANIFEST_MIN_COUNT_TO_MERGE_DEFAULT,
+        )
+    }
+
+    pub fn manifest_target_size_bytes(&self) -> Result<u64> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_MANIFEST_TARGET_SIZE_BYTES,
+            Self::PROPERTY_MANIFEST_TARGET_SIZE_BYTES_DEFAULT,
+        )
+    }
+
+    pub fn manifest_merge_enabled(&self) -> Result<bool> {
+        parse_property_bool(
+            self.properties,
+            Self::PROPERTY_MANIFEST_MERGE_ENABLED,
+            Self::PROPERTY_MANIFEST_MERGE_ENABLED_DEFAULT,
+        )
+    }
+
+    pub fn metadata_compression_codec(&self) -> Result<CompressionCodec> {
+        parse_metadata_file_compression(self.properties)
+    }
+
+    pub fn write_datafusion_fanout_enabled(&self) -> Result<bool> {
+        parse_property_bool(
+            self.properties,
+            Self::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED,
+            Self::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED_DEFAULT,
+        )
+    }
+
+    pub fn cdc_enabled(&self) -> Result<bool> {
+        parse_property_bool(
+            self.properties,
+            Self::PROPERTY_PARQUET_CDC_ENABLED,
+            Self::PROPERTY_PARQUET_CDC_ENABLED_DEFAULT,
+        )
+    }
+
+    pub fn cdc_min_chunk_size(&self) -> Result<usize> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE,
+            Self::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE_DEFAULT,
+        )
+    }
+
+    pub fn cdc_max_chunk_size(&self) -> Result<usize> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE,
+            Self::PROPERTY_PARQUET_CDC_MAX_CHUNK_SIZE_DEFAULT,
+        )
+    }
+
+    pub fn cdc_norm_level(&self) -> Result<i32> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_PARQUET_CDC_NORM_LEVEL,
+            Self::PROPERTY_PARQUET_CDC_NORM_LEVEL_DEFAULT,
+        )
+    }
+
+    pub fn parquet_compression_codec(&self) -> Result<CompressionCodec> {
+        parse_parquet_compression(self.properties)
+    }
+
+    pub fn parquet_row_group_size_bytes(&self) -> Result<usize> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES,
+            Self::PROPERTY_PARQUET_ROW_GROUP_SIZE_BYTES_DEFAULT,
+        )
+    }
+
+    pub fn parquet_page_size_bytes(&self) -> Result<usize> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_PARQUET_PAGE_SIZE_BYTES,
+            Self::PROPERTY_PARQUET_PAGE_SIZE_BYTES_DEFAULT,
+        )
+    }
+
+    pub fn parquet_page_row_limit(&self) -> Result<usize> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_PARQUET_PAGE_ROW_LIMIT,
+            Self::PROPERTY_PARQUET_PAGE_ROW_LIMIT_DEFAULT,
+        )
+    }
+
+    pub fn parquet_dict_size_bytes(&self) -> Result<usize> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_PARQUET_DICT_SIZE_BYTES,
+            Self::PROPERTY_PARQUET_DICT_SIZE_BYTES_DEFAULT,
+        )
+    }
+
+    pub fn write_data_location(&self) -> Result<Option<String>> {
+        parse_location_property(self.properties, Self::PROPERTY_WRITE_DATA_LOCATION)
+    }
+
+    pub fn write_folder_storage_location(&self) -> Result<Option<String>> {
+        parse_location_property(
+            self.properties,
+            Self::PROPERTY_WRITE_FOLDER_STORAGE_LOCATION,
+        )
+    }
+
+    pub fn write_object_storage_location(&self) -> Result<Option<String>> {
+        parse_location_property(
+            self.properties,
+            Self::PROPERTY_WRITE_OBJECT_STORAGE_LOCATION,
+        )
+    }
+
+    pub fn write_object_storage_partitioned_paths(&self) -> Result<bool> {
+        parse_property_bool(
+            self.properties,
+            Self::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS,
+            Self::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS_DEFAULT,
+        )
+    }
+
+    pub fn gc_enabled(&self) -> Result<bool> {
+        parse_property_bool(
+            self.properties,
+            Self::PROPERTY_GC_ENABLED,
+            Self::PROPERTY_GC_ENABLED_DEFAULT,
+        )
+    }
+
+    pub fn max_snapshot_age_ms(&self) -> Result<i64> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_MAX_SNAPSHOT_AGE_MS,
+            Self::PROPERTY_MAX_SNAPSHOT_AGE_MS_DEFAULT,
+        )
+    }
+
+    pub fn min_snapshots_to_keep(&self) -> Result<usize> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_MIN_SNAPSHOTS_TO_KEEP,
+            Self::PROPERTY_MIN_SNAPSHOTS_TO_KEEP_DEFAULT,
+        )
+    }
+
+    pub fn max_ref_age_ms(&self) -> Result<i64> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_MAX_REF_AGE_MS,
+            Self::PROPERTY_MAX_REF_AGE_MS_DEFAULT,
+        )
+    }
+
+    pub fn default_name_mapping(&self) -> Result<Option<NameMapping>> {
+        parse_optional_property(self.properties, Self::PROPERTY_DEFAULT_NAME_MAPPING)
+    }
+
+    pub fn encryption_key_id(&self) -> Result<Option<String>> {
+        parse_optional_property(self.properties, Self::PROPERTY_ENCRYPTION_KEY_ID)
+    }
+
+    pub fn encryption_data_key_length(&self) -> Result<usize> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_ENCRYPTION_DATA_KEY_LENGTH,
+            Self::PROPERTY_ENCRYPTION_DATA_KEY_LENGTH_DEFAULT,
+        )
+    }
+
+    pub fn write_delete_isolation_level(&self) -> Result<IsolationLevel> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_WRITE_DELETE_ISOLATION_LEVEL,
+            Self::PROPERTY_WRITE_ISOLATION_LEVEL_DEFAULT,
+        )
+    }
+
+    pub fn write_update_isolation_level(&self) -> Result<IsolationLevel> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_WRITE_UPDATE_ISOLATION_LEVEL,
+            Self::PROPERTY_WRITE_ISOLATION_LEVEL_DEFAULT,
+        )
+    }
+
+    pub fn write_merge_isolation_level(&self) -> Result<IsolationLevel> {
+        parse_property(
+            self.properties,
+            Self::PROPERTY_WRITE_MERGE_ISOLATION_LEVEL,
+            Self::PROPERTY_WRITE_ISOLATION_LEVEL_DEFAULT,
+        )
     }
 }
 
@@ -683,41 +740,41 @@ mod tests {
     #[test]
     fn test_table_properties_default() {
         let props = HashMap::new();
-        let table_properties = TableProperties::try_from(&props).unwrap();
+        let table_properties = TableProperties::new(&props);
         assert_eq!(
-            table_properties.commit_num_retries,
+            table_properties.commit_num_retries().unwrap(),
             TableProperties::PROPERTY_COMMIT_NUM_RETRIES_DEFAULT
         );
         assert_eq!(
-            table_properties.commit_min_retry_wait_ms,
+            table_properties.commit_min_retry_wait_ms().unwrap(),
             TableProperties::PROPERTY_COMMIT_MIN_RETRY_WAIT_MS_DEFAULT
         );
         assert_eq!(
-            table_properties.commit_max_retry_wait_ms,
+            table_properties.commit_max_retry_wait_ms().unwrap(),
             TableProperties::PROPERTY_COMMIT_MAX_RETRY_WAIT_MS_DEFAULT
         );
         assert_eq!(
-            table_properties.write_format_default,
+            table_properties.write_format_default().unwrap(),
             TableProperties::PROPERTY_DEFAULT_FILE_FORMAT_DEFAULT.to_string()
         );
         assert_eq!(
-            table_properties.write_target_file_size_bytes,
+            table_properties.write_target_file_size_bytes().unwrap(),
             TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES_DEFAULT
         );
         assert_eq!(
-            table_properties.metadata_compression_codec,
+            table_properties.metadata_compression_codec().unwrap(),
             CompressionCodec::None
         );
         assert_eq!(
-            table_properties.write_delete_isolation_level,
+            table_properties.write_delete_isolation_level().unwrap(),
             TableProperties::PROPERTY_WRITE_ISOLATION_LEVEL_DEFAULT
         );
         assert_eq!(
-            table_properties.write_update_isolation_level,
+            table_properties.write_update_isolation_level().unwrap(),
             TableProperties::PROPERTY_WRITE_ISOLATION_LEVEL_DEFAULT
         );
         assert_eq!(
-            table_properties.write_merge_isolation_level,
+            table_properties.write_merge_isolation_level().unwrap(),
             TableProperties::PROPERTY_WRITE_ISOLATION_LEVEL_DEFAULT
         );
     }
@@ -754,21 +811,24 @@ mod tests {
                 "SNAPSHOT".to_string(),
             ),
         ]);
-        let table_properties = TableProperties::try_from(&props).unwrap();
-        assert_eq!(table_properties.commit_num_retries, 10);
-        assert_eq!(table_properties.commit_max_retry_wait_ms, 20);
-        assert_eq!(table_properties.write_format_default, "avro".to_string());
-        assert_eq!(table_properties.write_target_file_size_bytes, 512);
+        let table_properties = TableProperties::new(&props);
+        assert_eq!(table_properties.commit_num_retries().unwrap(), 10);
+        assert_eq!(table_properties.commit_max_retry_wait_ms().unwrap(), 20);
+        assert_eq!(table_properties.write_format_default().unwrap(), "avro");
         assert_eq!(
-            table_properties.write_delete_isolation_level,
+            table_properties.write_target_file_size_bytes().unwrap(),
+            512
+        );
+        assert_eq!(
+            table_properties.write_delete_isolation_level().unwrap(),
             IsolationLevel::Snapshot
         );
         assert_eq!(
-            table_properties.write_update_isolation_level,
+            table_properties.write_update_isolation_level().unwrap(),
             IsolationLevel::Serializable
         );
         assert_eq!(
-            table_properties.write_merge_isolation_level,
+            table_properties.write_merge_isolation_level().unwrap(),
             IsolationLevel::Snapshot
         );
     }
@@ -779,9 +839,9 @@ mod tests {
             TableProperties::PROPERTY_METADATA_COMPRESSION_CODEC.to_string(),
             "gzip".to_string(),
         )]);
-        let table_properties = TableProperties::try_from(&props).unwrap();
+        let table_properties = TableProperties::new(&props);
         assert_eq!(
-            table_properties.metadata_compression_codec,
+            table_properties.metadata_compression_codec().unwrap(),
             CompressionCodec::gzip_default()
         );
     }
@@ -836,10 +896,11 @@ mod tests {
             "abc".to_string(),
         )]);
 
-        let table_properties =
-            TableProperties::try_from(&invalid_retries).unwrap_err();
+        let err = TableProperties::new(&invalid_retries)
+            .commit_num_retries()
+            .unwrap_err();
         assert!(
-            table_properties.to_string().contains(
+            err.to_string().contains(
                 "Invalid value for commit.retry.num-retries: invalid digit found in string"
             )
         );
@@ -848,10 +909,11 @@ mod tests {
             TableProperties::PROPERTY_COMMIT_MIN_RETRY_WAIT_MS.to_string(),
             "abc".to_string(),
         )]);
-        let table_properties =
-            TableProperties::try_from(&invalid_min_wait).unwrap_err();
+        let err = TableProperties::new(&invalid_min_wait)
+            .commit_min_retry_wait_ms()
+            .unwrap_err();
         assert!(
-            table_properties.to_string().contains(
+            err.to_string().contains(
                 "Invalid value for commit.retry.min-wait-ms: invalid digit found in string"
             )
         );
@@ -860,10 +922,11 @@ mod tests {
             TableProperties::PROPERTY_COMMIT_MAX_RETRY_WAIT_MS.to_string(),
             "abc".to_string(),
         )]);
-        let table_properties =
-            TableProperties::try_from(&invalid_max_wait).unwrap_err();
+        let err = TableProperties::new(&invalid_max_wait)
+            .commit_max_retry_wait_ms()
+            .unwrap_err();
         assert!(
-            table_properties.to_string().contains(
+            err.to_string().contains(
                 "Invalid value for commit.retry.max-wait-ms: invalid digit found in string"
             )
         );
@@ -872,9 +935,10 @@ mod tests {
             TableProperties::PROPERTY_WRITE_TARGET_FILE_SIZE_BYTES.to_string(),
             "abc".to_string(),
         )]);
-        let table_properties =
-            TableProperties::try_from(&invalid_target_size).unwrap_err();
-        assert!(table_properties.to_string().contains(
+        let err = TableProperties::new(&invalid_target_size)
+            .write_target_file_size_bytes()
+            .unwrap_err();
+        assert!(err.to_string().contains(
             "Invalid value for write.target-file-size-bytes: invalid digit found in string"
         ));
     }
@@ -882,8 +946,8 @@ mod tests {
     #[test]
     fn test_cdc_disabled_by_default() {
         let props = HashMap::new();
-        let tp = TableProperties::try_from(&props).unwrap();
-        assert!(!tp.cdc_enabled);
+        let tp = TableProperties::new(&props);
+        assert!(!tp.cdc_enabled().unwrap());
     }
 
     #[test]
@@ -892,11 +956,11 @@ mod tests {
             TableProperties::PROPERTY_PARQUET_CDC_ENABLED.to_string(),
             "true".to_string(),
         )]);
-        let tp = TableProperties::try_from(&props).unwrap();
-        assert!(tp.cdc_enabled);
-        assert_eq!(tp.cdc_min_chunk_size, 256 * 1024);
-        assert_eq!(tp.cdc_max_chunk_size, 1024 * 1024);
-        assert_eq!(tp.cdc_norm_level, 0);
+        let tp = TableProperties::new(&props);
+        assert!(tp.cdc_enabled().unwrap());
+        assert_eq!(tp.cdc_min_chunk_size().unwrap(), 256 * 1024);
+        assert_eq!(tp.cdc_max_chunk_size().unwrap(), 1024 * 1024);
+        assert_eq!(tp.cdc_norm_level().unwrap(), 0);
     }
 
     #[test]
@@ -905,8 +969,8 @@ mod tests {
             TableProperties::PROPERTY_PARQUET_CDC_MIN_CHUNK_SIZE.to_string(),
             "262144".to_string(),
         )]);
-        let tp = TableProperties::try_from(&props).unwrap();
-        assert!(!tp.cdc_enabled);
+        let tp = TableProperties::new(&props);
+        assert!(!tp.cdc_enabled().unwrap());
     }
 
     #[test]
@@ -929,11 +993,11 @@ mod tests {
                 "1".to_string(),
             ),
         ]);
-        let tp = TableProperties::try_from(&props).unwrap();
-        assert!(tp.cdc_enabled);
-        assert_eq!(tp.cdc_min_chunk_size, 200000);
-        assert_eq!(tp.cdc_max_chunk_size, 900000);
-        assert_eq!(tp.cdc_norm_level, 1);
+        let tp = TableProperties::new(&props);
+        assert!(tp.cdc_enabled().unwrap());
+        assert_eq!(tp.cdc_min_chunk_size().unwrap(), 200000);
+        assert_eq!(tp.cdc_max_chunk_size().unwrap(), 900000);
+        assert_eq!(tp.cdc_norm_level().unwrap(), 1);
     }
 
     #[test]
@@ -948,9 +1012,98 @@ mod tests {
                 "not_a_number".to_string(),
             ),
         ]);
-        let err = TableProperties::try_from(&props).unwrap_err();
+        let err = TableProperties::new(&props)
+            .cdc_min_chunk_size()
+            .unwrap_err();
         assert!(err.to_string().contains(
             "Invalid value for write.parquet.content-defined-chunking.min-chunk-size"
         ));
+    }
+
+    #[test]
+    fn test_properties_are_parsed_lazily() {
+        let props = HashMap::from([
+            (
+                TableProperties::PROPERTY_COMMIT_NUM_RETRIES.to_string(),
+                "not-a-number".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_GC_ENABLED.to_string(),
+                "FALSE".to_string(),
+            ),
+        ]);
+        let table_properties = TableProperties::new(&props);
+
+        assert!(!table_properties.gc_enabled().unwrap());
+        assert!(table_properties.commit_num_retries().is_err());
+    }
+
+    #[test]
+    fn test_boolean_properties_are_case_insensitive() {
+        let props = HashMap::from([
+            (
+                TableProperties::PROPERTY_GC_ENABLED.to_string(),
+                "FaLsE".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_DATAFUSION_WRITE_FANOUT_ENABLED.to_string(),
+                "TrUe".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_PARQUET_CDC_ENABLED.to_string(),
+                "TrUe".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_MANIFEST_MERGE_ENABLED.to_string(),
+                "FaLsE".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_METADATA_DELETE_AFTER_COMMIT_ENABLED
+                    .to_string(),
+                "TrUe".to_string(),
+            ),
+            (
+                TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS
+                    .to_string(),
+                "FaLsE".to_string(),
+            ),
+        ]);
+        let table_properties = TableProperties::new(&props);
+
+        assert!(!table_properties.gc_enabled().unwrap());
+        assert!(table_properties.write_datafusion_fanout_enabled().unwrap());
+        assert!(table_properties.cdc_enabled().unwrap());
+        assert!(!table_properties.manifest_merge_enabled().unwrap());
+        assert!(
+            table_properties
+                .metadata_delete_after_commit_enabled()
+                .unwrap()
+        );
+        assert!(
+            !table_properties
+                .write_object_storage_partitioned_paths()
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn test_default_name_mapping() {
+        let props = HashMap::from([(
+            TableProperties::PROPERTY_DEFAULT_NAME_MAPPING.to_string(),
+            r#"[{"field-id":1,"names":["id"]}]"#.to_string(),
+        )]);
+
+        assert!(
+            TableProperties::new(&props)
+                .default_name_mapping()
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            TableProperties::new(&HashMap::new())
+                .default_name_mapping()
+                .unwrap()
+                .is_none()
+        );
     }
 }

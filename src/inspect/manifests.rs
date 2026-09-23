@@ -277,28 +277,23 @@ impl<'a> ManifestsTable<'a> {
                 .unwrap()
                 .append_option(summary.contains_nan);
 
-            partition_summaries_builder
-                .field_builder::<StringBuilder>(2)
-                .unwrap()
-                .append_option(summary.lower_bound.as_ref().map(|v| {
-                    Datum::try_from_bytes(
-                        v,
-                        field.field_type.as_primitive_type().unwrap().clone(),
-                    )
+            let field_type = field.field_type.as_primitive_type().unwrap();
+            for (index, bound) in
+                [(2, &summary.lower_bound), (3, &summary.upper_bound)]
+            {
+                let bound = bound
+                    .as_ref()
+                    .filter(|_| *field_type != PrimitiveType::Unknown)
+                    .map(|value| {
+                        Datum::try_from_bytes(value, field_type.clone())
+                            .unwrap()
+                            .to_string()
+                    });
+                partition_summaries_builder
+                    .field_builder::<StringBuilder>(index)
                     .unwrap()
-                    .to_string()
-                }));
-            partition_summaries_builder
-                .field_builder::<StringBuilder>(3)
-                .unwrap()
-                .append_option(summary.upper_bound.as_ref().map(|v| {
-                    Datum::try_from_bytes(
-                        v,
-                        field.field_type.as_primitive_type().unwrap().clone(),
-                    )
-                    .unwrap()
-                    .to_string()
-                }));
+                    .append_option(bound);
+            }
             partition_summaries_builder.append(true);
         }
         builder.append(true);

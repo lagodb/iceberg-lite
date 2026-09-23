@@ -32,7 +32,7 @@ use crate::spec::manifest::_serde::{ManifestEntryV1, ManifestEntryV2};
 use crate::spec::manifest::{manifest_schema_v1, manifest_schema_v2};
 use crate::spec::{
     DataContentType, DataFile, FieldSummary, ManifestEntry, ManifestFile,
-    ManifestMetadata, ManifestStatus, PrimitiveLiteral, SchemaRef, StructType,
+    ManifestMetadata, ManifestStatus, PrimitiveLiteral, SchemaRef, StructType, Type,
 };
 use crate::{Error, ErrorKind};
 
@@ -478,6 +478,7 @@ impl ManifestWriter {
             .metadata
             .partition_spec
             .partition_type(&self.metadata.schema)?;
+        let partition_struct_type = Type::Struct(partition_type.clone());
         let table_schema = &self.metadata.schema;
         let avro_schema = match self.metadata.format_version {
             FormatVersion::V1 => manifest_schema_v1(&partition_type)?,
@@ -528,15 +529,16 @@ impl ManifestWriter {
         // Write manifest entries
         for entry in std::mem::take(&mut self.manifest_entries) {
             let value = match self.metadata.format_version {
-                FormatVersion::V1 => {
-                    to_value(ManifestEntryV1::try_from(entry, &partition_type)?)?
-                        .resolve(&avro_schema)?
-                }
+                FormatVersion::V1 => to_value(ManifestEntryV1::try_from(
+                    entry,
+                    &partition_struct_type,
+                )?)?
+                .resolve(&avro_schema)?,
                 // Manifest entry format did not change between V2 and V3
-                FormatVersion::V2 | FormatVersion::V3 => {
-                    to_value(ManifestEntryV2::try_from(entry, &partition_type)?)?
-                        .resolve(&avro_schema)?
-                }
+                FormatVersion::V2 | FormatVersion::V3 => to_value(
+                    ManifestEntryV2::try_from(entry, &partition_struct_type)?,
+                )?
+                .resolve(&avro_schema)?,
             };
 
             avro_writer.append(value)?;

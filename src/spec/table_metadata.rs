@@ -36,14 +36,15 @@ pub use super::table_metadata_builder::{
     TableMetadataBuildResult, TableMetadataBuilder,
 };
 use super::{
-    DEFAULT_PARTITION_SPEC_ID, PartitionSpecRef, PartitionStatisticsFile, SchemaId,
-    SchemaRef, SnapshotRef, SnapshotRetention, SortOrder, SortOrderRef,
-    StatisticsFile, StructType, TableProperties, parse_metadata_file_compression,
+    DEFAULT_PARTITION_SPEC_ID, PartitionSpecRef, PartitionStatisticsFile, Schema,
+    SchemaId, SchemaRef, SnapshotRef, SnapshotRetention, SortOrder, SortOrderRef,
+    StatisticsFile, StructType, TableProperties, Transform,
 };
 use crate::catalog::{METADATA_FOLDER_NAME, MetadataLocation};
 use crate::compression::CompressionCodec;
 use crate::error::{Result, timestamp_ms_to_utc};
 use crate::io::FileIO;
+use crate::partitioning::compute_unified_partition_type;
 use crate::spec::EncryptedKey;
 use crate::{Error, ErrorKind};
 
@@ -285,6 +286,15 @@ impl TableMetadata {
         &self.default_partition_type
     }
 
+    /// Returns the unified partition type across every partition spec in the
+    /// table, resolved against `schema`.
+    pub fn unified_partition_type(&self, schema: &Schema) -> Result<StructType> {
+        compute_unified_partition_type(
+            self.partition_specs_iter().map(AsRef::as_ref),
+            schema,
+        )
+    }
+
     #[inline]
     /// Returns spec id of the "current" partition spec.
     pub fn default_partition_spec_id(&self) -> i32 {
@@ -395,8 +405,8 @@ impl TableMetadata {
     /// subdirectory when the property is absent.
     pub fn metadata_location(&self) -> Result<String> {
         Ok(self
-            .table_properties()?
-            .write_metadata_path
+            .table_properties()
+            .write_metadata_path()?
             .unwrap_or_else(|| {
                 format!("{}/{}", self.location(), METADATA_FOLDER_NAME)
             }))
@@ -404,15 +414,12 @@ impl TableMetadata {
 
     /// Returns the metadata compression codec from table properties.
     pub fn metadata_compression_codec(&self) -> Result<CompressionCodec> {
-        parse_metadata_file_compression(&self.properties)
+        self.table_properties().metadata_compression_codec()
     }
 
-    /// Returns typed table properties parsed from the raw properties map with defaults.
-    pub fn table_properties(&self) -> Result<TableProperties> {
-        TableProperties::try_from(&self.properties).map_err(|e| {
-            Error::new(ErrorKind::DataInvalid, "Invalid table properties")
-                .with_source(e)
-        })
+    /// Returns a borrowed, lazily parsed view of this table's properties.
+    pub fn table_properties(&self) -> TableProperties<'_> {
+        TableProperties::new(&self.properties)
     }
 
     /// Return location of statistics files.
@@ -524,7 +531,7 @@ impl TableMetadata {
         metadata_location: impl AsRef<str>,
     ) -> Result<()> {
         let metadata_location = metadata_location.as_ref();
-        let codec = parse_metadata_file_compression(&self.properties)?;
+        let codec = self.metadata_compression_codec()?;
 
         if let Ok(parsed_location) = MetadataLocation::from_str(metadata_location)
             && codec != parsed_location.compression_codec()
@@ -577,8 +584,24 @@ impl TableMetadata {
         Ok(self)
     }
 
-    /// If the default partition spec is not present in specs, add it
+    /// Validate active default-spec sources and add the spec if it is not present.
     fn try_normalize_partition_spec(&mut self) -> Result<()> {
+        for field in self.default_spec.fields() {
+            if field.transform != Transform::Void
+                && self.current_schema().field_by_id(field.source_id).is_none()
+            {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Default partition spec {} references missing source field {} in current schema {}",
+                        self.default_spec.spec_id(),
+                        field.source_id,
+                        self.current_schema_id
+                    ),
+                ));
+            }
+        }
+
         if self
             .partition_spec_by_id(self.default_spec.spec_id())
             .is_none()

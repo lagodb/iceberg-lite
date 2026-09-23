@@ -56,6 +56,7 @@ pub struct ArrowReaderBuilder {
     concurrency_limit_data_files: usize,
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
 }
 
@@ -70,6 +71,7 @@ impl ArrowReaderBuilder {
             concurrency_limit_data_files: num_cpus,
             row_group_filtering_enabled: true,
             row_selection_enabled: false,
+            bloom_filter_enabled: false,
             parquet_read_options: ParquetReadOptions::default(),
         }
     }
@@ -99,6 +101,12 @@ impl ArrowReaderBuilder {
     /// Determines whether to enable row selection.
     pub fn with_row_selection_enabled(mut self, row_selection_enabled: bool) -> Self {
         self.row_selection_enabled = row_selection_enabled;
+        self
+    }
+
+    /// Enables Parquet bloom-filter row-group pruning for equality and IN predicates.
+    pub fn with_bloom_filter_enabled(mut self, bloom_filter_enabled: bool) -> Self {
+        self.bloom_filter_enabled = bloom_filter_enabled;
         self
     }
 
@@ -143,6 +151,7 @@ impl ArrowReaderBuilder {
             concurrency_limit_data_files: self.concurrency_limit_data_files,
             row_group_filtering_enabled: self.row_group_filtering_enabled,
             row_selection_enabled: self.row_selection_enabled,
+            bloom_filter_enabled: self.bloom_filter_enabled,
             parquet_read_options: self.parquet_read_options,
         }
     }
@@ -161,5 +170,6 @@ pub struct ArrowReader {
 
     row_group_filtering_enabled: bool,
     row_selection_enabled: bool,
+    bloom_filter_enabled: bool,
     parquet_read_options: ParquetReadOptions,
 }

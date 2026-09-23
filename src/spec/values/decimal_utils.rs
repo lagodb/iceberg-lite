@@ -200,6 +200,29 @@ pub fn i128_to_be_bytes_min(value: i128) -> Vec<u8> {
     bytes[start..].to_vec()
 }
 
+/// Encode an i128 as exactly `len` big-endian two's-complement bytes.
+/// Returns `None` when the value cannot be represented without truncation.
+pub(crate) fn decimal_to_fixed_length_bytes_exact(
+    value: i128,
+    len: usize,
+) -> Option<Vec<u8>> {
+    if len == 0 || len > 16 {
+        return None;
+    }
+
+    let bytes = value.to_be_bytes();
+    let offset = 16 - len;
+    let sign_byte = if value < 0 { 0xff } else { 0x00 };
+    if bytes[..offset].iter().any(|&byte| byte != sign_byte) {
+        return None;
+    }
+    if (bytes[offset] & 0x80 != 0) != (value < 0) {
+        return None;
+    }
+
+    Some(bytes[offset..].to_vec())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

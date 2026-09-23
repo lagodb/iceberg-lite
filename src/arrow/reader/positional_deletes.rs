@@ -488,6 +488,8 @@ mod tests {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         }];
@@ -753,6 +755,8 @@ mod tests {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         };
@@ -994,6 +998,8 @@ mod tests {
             partition_spec: None,
             unified_partition_type: None,
             name_mapping: None,
+            sort_order_id: None,
+            sort_order: None,
             case_sensitive: false,
             key_metadata: None,
         };

@@ -326,7 +326,7 @@ fn injected_manager_keeps_its_endpoint_headers_and_parameters() {
             "audience".to_owned(),
             "aud-1".to_owned(),
         )]));
-    let catalog = fixture.catalog_with_auth_manager([], Arc::new(manager));
+    let catalog = fixture.catalog_with_auth_manager([], manager);
 
     catalog
         .list_namespaces(&SessionContext::empty(), None)
@@ -393,7 +393,7 @@ fn auth_manager_receives_user_then_merged_properties() {
     };
     let catalog = fixture.catalog_with_auth_manager(
         [("warehouse", "client-wh"), ("custom", "user")],
-        Arc::new(manager),
+        manager,
     );
 
     catalog
@@ -425,7 +425,7 @@ fn injected_auth_manager_overrides_the_configured_auth_type() {
     };
     let catalog = fixture.catalog_with_auth_manager(
         [(REST_CATALOG_PROP_AUTH_TYPE, "kerberos")],
-        Arc::new(manager),
+        manager,
     );
     let endpoint: super::super::Endpoint =
         "GET /v1/{prefix}/namespaces".parse().unwrap();
@@ -481,8 +481,8 @@ fn init_session_is_dropped_before_catalog_session_is_created() {
     let fixture = RestTestFixture::default();
     fixture.expect_config(serde_json::json!({"defaults": {}, "overrides": {}}));
     let dropped = Arc::new(AtomicBool::new(false));
-    let catalog = fixture
-        .catalog_with_auth_manager([], Arc::new(GuardManager(dropped.clone())));
+    let catalog =
+        fixture.catalog_with_auth_manager([], GuardManager(dropped.clone()));
 
     let endpoint: super::super::Endpoint =
         "GET /v1/{prefix}/namespaces".parse().unwrap();

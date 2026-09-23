@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::delete_file_index::DeleteFileIndex;
@@ -26,7 +27,8 @@ use crate::scan::{
 };
 use crate::spec::{
     ManifestContentType, ManifestEntryRef, ManifestFile, ManifestList, NameMapping,
-    PartitionSpecRef, SchemaRef, SnapshotRef, StructType, TableMetadataRef,
+    PartitionSpecRef, SchemaRef, SnapshotRef, SortOrderRef, StructType,
+    TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
 
@@ -46,6 +48,7 @@ pub(crate) struct ManifestFileContext {
     pub case_sensitive: bool,
     pub partition_spec: PartitionSpecRef,
     pub unified_partition_type: Option<Arc<StructType>>,
+    pub sort_orders: Arc<HashMap<i64, SortOrderRef>>,
 }
 
 /// Wraps a [`ManifestEntryRef`] alongside the objects that are needed
@@ -64,6 +67,8 @@ pub(crate) struct ManifestEntryContext {
     pub delete_file_index: Option<DeleteFileIndex>,
     pub name_mapping: Option<Arc<NameMapping>>,
     pub first_row_id: Option<u64>,
+    pub sort_order_id: Option<i32>,
+    pub sort_order: Option<SortOrderRef>,
     pub case_sensitive: bool,
 }
 
@@ -76,6 +81,11 @@ impl ManifestFileContext {
         let mut entries = Vec::with_capacity(manifest.entries().len());
         for manifest_entry in manifest.entries() {
             let entry_first_row_id = manifest_entry.first_row_id()?;
+            let sort_order_id = manifest_entry.data_file().sort_order_id();
+            let sort_order = sort_order_id
+                .and_then(|id| self.sort_orders.get(&i64::from(id)))
+                .filter(|order| !order.is_unsorted())
+                .cloned();
 
             entries.push(ManifestEntryContext {
                 manifest_entry: manifest_entry.clone(),
@@ -90,6 +100,8 @@ impl ManifestFileContext {
                 delete_file_index: self.delete_file_index.clone(),
                 name_mapping: self.name_mapping.clone(),
                 first_row_id: entry_first_row_id,
+                sort_order_id,
+                sort_order,
                 case_sensitive: self.case_sensitive,
             });
         }
@@ -122,7 +134,7 @@ impl ManifestEntryContext {
             self.manifest_entry.sequence_number(),
         );
 
-        Ok(FileScanTask {
+        let task = FileScanTask {
             file_size_in_bytes: self.manifest_entry.file_size_in_bytes(),
             start: 0,
             length: self.manifest_entry.file_size_in_bytes(),
@@ -147,6 +159,8 @@ impl ManifestEntryContext {
             partition: Some(self.manifest_entry.data_file.partition.clone()),
             partition_spec: Some(self.partition_spec),
             unified_partition_type: self.unified_partition_type,
+            sort_order_id: self.sort_order_id,
+            sort_order: self.sort_order,
             name_mapping: self.name_mapping,
             case_sensitive: self.case_sensitive,
             key_metadata: self
@@ -154,7 +168,9 @@ impl ManifestEntryContext {
                 .data_file()
                 .key_metadata()
                 .map(Box::from),
-        })
+        };
+        task.validate()?;
+        Ok(task)
     }
 }
 
@@ -177,6 +193,7 @@ pub(crate) struct PlanContext {
     pub manifest_evaluator_cache: Arc<ManifestEvaluatorCache>,
     pub expression_evaluator_cache: Arc<ExpressionEvaluatorCache>,
     pub unified_partition_type: Option<Arc<StructType>>,
+    pub sort_orders: Arc<HashMap<i64, SortOrderRef>>,
 }
 
 impl PlanContext {
@@ -206,6 +223,11 @@ impl PlanContext {
         delete_file_index: Option<DeleteFileIndex>,
     ) -> Result<ManifestEntryContext> {
         let partition_spec = self.partition_spec(partition_spec_id)?;
+        let sort_order_id = manifest_entry.data_file().sort_order_id();
+        let sort_order = sort_order_id
+            .and_then(|id| self.sort_orders.get(&i64::from(id)))
+            .filter(|order| !order.is_unsorted())
+            .cloned();
         Ok(ManifestEntryContext {
             manifest_entry,
             expression_evaluator_cache: self.expression_evaluator_cache.clone(),
@@ -219,6 +241,8 @@ impl PlanContext {
             delete_file_index,
             name_mapping: self.name_mapping.clone(),
             first_row_id: None,
+            sort_order_id,
+            sort_order,
             case_sensitive: self.case_sensitive,
         })
     }
@@ -351,6 +375,7 @@ impl PlanContext {
             case_sensitive: self.case_sensitive,
             partition_spec,
             unified_partition_type: self.unified_partition_type.clone(),
+            sort_orders: self.sort_orders.clone(),
         })
     }
 
