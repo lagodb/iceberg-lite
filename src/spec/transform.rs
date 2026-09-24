@@ -403,6 +403,10 @@ impl Transform {
         name: &str,
         predicate: &BoundPredicate,
     ) -> Result<Option<Predicate>> {
+        if matches!(self, Transform::Unknown) {
+            return Ok(None);
+        }
+
         let func = create_transform_function(self)?;
 
         match self {
@@ -562,6 +566,10 @@ impl Transform {
         name: &str,
         predicate: &BoundPredicate,
     ) -> Result<Option<Predicate>> {
+        if matches!(self, Transform::Unknown) {
+            return Ok(None);
+        }
+
         let func = create_transform_function(self)?;
 
         match self {
