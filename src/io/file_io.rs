@@ -47,13 +47,17 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
-    /// Resolve a raw URI or path into a storage-relative key.
+    /// Determine the path slice passed to this storage's file operations.
     ///
-    /// Returns the byte offset into `uri` where the storage-relative key begins.
-    /// Implementations should validate that the URI targets the correct storage
-    /// namespace (e.g., bucket, container) and reject mismatches.
+    /// Returns the byte offset into `uri` where that path begins. Storage bound
+    /// to a fixed namespace can validate the URI and return its relative-key
+    /// offset. The default implementation strips the `scheme://` prefix.
     ///
-    /// The default implementation strips the `scheme://` prefix.
+    /// Storage that routes full URIs can return zero and defer parsing and
+    /// namespace validation to its file operations. Those operations must reject
+    /// invalid paths and namespace mismatches before accessing storage. In this
+    /// case, constructing an `InputFile` or `OutputFile` does not validate its
+    /// location; errors are reported when a file operation uses that location.
     fn resolve_uri(&self, uri: &str) -> Result<usize> {
         let prefix = format!("{}://", self.scheme());
         if uri.starts_with(&prefix) {

@@ -42,7 +42,7 @@ use crate::metadata_columns::{
 };
 use crate::overlay::{SnapshotDelta, SnapshotDeltaRemovalLookup};
 
-use crate::spec::{DataContentType, ManifestContentType, SnapshotRef};
+use crate::spec::{DataContentType, ManifestContentType, SchemaRef, SnapshotRef};
 use crate::table::Table;
 use crate::util::available_parallelism;
 use crate::{Error, ErrorKind, Result};
@@ -55,7 +55,8 @@ pub type ArrowRecordBatchIterator =
 pub struct TableScanBuilder<'a> {
     table: &'a Table,
     projection: ScanProjection,
-    snapshot_id: Option<i64>,
+    snapshot: SnapshotSelection,
+    read_schema: Option<SchemaRef>,
     batch_size: Option<usize>,
     case_sensitive: bool,
     filter: Option<Predicate>,
@@ -66,6 +67,14 @@ pub struct TableScanBuilder<'a> {
     row_selection_enabled: bool,
     bloom_filter_enabled: bool,
     delta: Option<Arc<SnapshotDelta>>,
+}
+
+// An empty baseline is distinct from resolving the table's current snapshot.
+#[derive(Clone, Copy)]
+enum SnapshotSelection {
+    Current,
+    Id(i64),
+    Empty,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -83,7 +92,8 @@ impl<'a> TableScanBuilder<'a> {
         Self {
             table,
             projection: ScanProjection::All,
-            snapshot_id: None,
+            snapshot: SnapshotSelection::Current,
+            read_schema: None,
             batch_size: None,
             case_sensitive: true,
             filter: None,
@@ -159,7 +169,7 @@ impl<'a> TableScanBuilder<'a> {
 
     /// Set the snapshot to scan. When not set, it uses current snapshot.
     pub fn snapshot_id(mut self, snapshot_id: i64) -> Self {
-        self.snapshot_id = Some(snapshot_id);
+        self.snapshot = SnapshotSelection::Id(snapshot_id);
         self
     }
 
@@ -225,56 +235,76 @@ impl<'a> TableScanBuilder<'a> {
         self
     }
 
+    /// Read no committed snapshot, even when the table has a current snapshot.
+    /// Transaction-local files supplied by `with_delta` remain visible. Without
+    /// an explicit read schema, the table's current schema is used.
+    pub fn without_snapshot(mut self) -> Self {
+        self.snapshot = SnapshotSelection::Empty;
+        self
+    }
+
     /// Layer a transaction-local snapshot delta over the committed table state.
     pub fn with_delta(mut self, delta: Arc<SnapshotDelta>) -> Self {
         self.delta = Some(delta);
         self
     }
 
+    /// Use an explicit logical schema for field selection, predicate binding,
+    /// and reader output without changing the snapshot that supplies files.
+    ///
+    /// Field IDs must belong to this table's schema evolution history. This
+    /// permits a current definition (for example, renamed columns) to read an
+    /// older data version. File schemas and partition specs remain those of
+    /// the selected snapshot and its manifests.
+    pub fn with_read_schema(mut self, schema: SchemaRef) -> Self {
+        self.read_schema = Some(schema);
+        self
+    }
+
     /// Build the table scan.
     pub fn build(self) -> Result<TableScan> {
-        let use_current_schema = self.snapshot_id.is_none();
-        let snapshot = match self.snapshot_id {
-            Some(snapshot_id) => self
-                .table
-                .metadata()
-                .snapshot_by_id(snapshot_id)
-                .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Snapshot with id {snapshot_id} not found"),
-                    )
-                })?
-                .clone()
-                .into(),
-            None => {
-                let current_snapshot =
-                    self.table.metadata().current_snapshot().cloned();
-                if current_snapshot.is_none()
-                    && self.delta.as_ref().is_none_or(|delta| delta.is_empty())
-                {
-                    return Ok(TableScan {
-                        batch_size: self.batch_size,
-                        column_names: self.projection.column_names(),
-                        file_io: self.table.file_io().clone(),
-                        plan_context: None,
-                        delta: None,
-                        concurrency_limit_data_files: self
-                            .concurrency_limit_data_files,
-                        concurrency_limit_manifest_entries: self
-                            .concurrency_limit_manifest_entries,
-                        concurrency_limit_manifest_files: self
-                            .concurrency_limit_manifest_files,
-                        row_group_filtering_enabled: self.row_group_filtering_enabled,
-                        row_selection_enabled: self.row_selection_enabled,
-                        bloom_filter_enabled: self.bloom_filter_enabled,
-                    });
-                }
-                current_snapshot
+        let use_current_schema = !matches!(self.snapshot, SnapshotSelection::Id(_));
+        let snapshot = match self.snapshot {
+            SnapshotSelection::Id(snapshot_id) => Some(
+                self.table
+                    .metadata()
+                    .snapshot_by_id(snapshot_id)
+                    .ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!("Snapshot with id {snapshot_id} not found"),
+                        )
+                    })?
+                    .clone(),
+            ),
+            SnapshotSelection::Current => {
+                self.table.metadata().current_snapshot().cloned()
             }
+            SnapshotSelection::Empty => None,
         };
+        if snapshot.is_none()
+            && self.delta.as_ref().is_none_or(|delta| delta.is_empty())
+        {
+            return Ok(TableScan {
+                batch_size: self.batch_size,
+                column_names: self.projection.column_names(),
+                file_io: self.table.file_io().clone(),
+                plan_context: None,
+                delta: None,
+                concurrency_limit_data_files: self.concurrency_limit_data_files,
+                concurrency_limit_manifest_entries: self
+                    .concurrency_limit_manifest_entries,
+                concurrency_limit_manifest_files: self
+                    .concurrency_limit_manifest_files,
+                row_group_filtering_enabled: self.row_group_filtering_enabled,
+                row_selection_enabled: self.row_selection_enabled,
+                bloom_filter_enabled: self.bloom_filter_enabled,
+            });
+        }
 
-        let schema = if use_current_schema {
+        let schema = if let Some(schema) = self.read_schema {
+            schema
+        } else if use_current_schema {
             // A current table scan projects the table's current schema, not the
             // schema that happened to write the current snapshot. Schema-only
             // evolution can advance current-schema-id without creating a new

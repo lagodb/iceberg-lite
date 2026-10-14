@@ -593,19 +593,12 @@ impl RestCatalog {
         }
     }
 
-    /// Validate that the server supports atomic table-change transactions.
-    ///
-    /// Writable adapters call this before producing data or delete files.
-    pub fn ensure_transaction_commit_supported(&self) -> Result<()> {
-        self.inner.ensure_transaction_commit_supported()
-    }
-
     /// Builds one atomic REST catalog request from prepared table commits.
     ///
     /// # Errors
     ///
     /// Returns an error when no table changes are supplied, the server does
-    /// not advertise the transaction endpoint, or request serialization fails.
+    /// not advertise the transaction endpoint, or request construction fails.
     pub fn prepare_transaction_commit(
         &self,
         commits: Vec<PreparedTableCommit>,
@@ -1544,9 +1537,14 @@ impl RestSessionCatalog {
                 "REST transaction requires at least one table change",
             ));
         }
-        self.ensure_transaction_commit_supported()?;
 
         let client = self.client()?;
+        if !client.endpoints.contains(&V1_COMMIT_TRANSACTION) {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "REST catalog does not support atomic transaction commits",
+            ));
+        }
         let table_count = commits.len();
         let mut table_changes = Vec::with_capacity(table_count);
         for prepared in commits {
@@ -1565,16 +1563,6 @@ impl RestSessionCatalog {
                 .json(&CommitTransactionRequest { table_changes }),
         )?;
         Ok(PreparedRestCommit::new(request, table_count))
-    }
-
-    fn ensure_transaction_commit_supported(&self) -> Result<()> {
-        if self.supports_endpoint(&V1_COMMIT_TRANSACTION)? {
-            return Ok(());
-        }
-        Err(Error::new(
-            ErrorKind::FeatureUnsupported,
-            "REST catalog does not support atomic transaction commits",
-        ))
     }
 
     fn send_prepared_commit(&self, commit: PreparedRestCommit) -> Result<()> {
