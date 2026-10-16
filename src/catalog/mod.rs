@@ -21,6 +21,7 @@ pub mod memory;
 mod metadata_location;
 pub mod rest;
 mod session;
+pub mod sqlite;
 pub(crate) mod utils;
 
 use std::collections::HashMap;

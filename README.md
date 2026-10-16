@@ -113,3 +113,97 @@ cargo clippy --all-targets
 ## License
 
 Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+
+
+## SQLite catalog
+
+`catalog::sqlite::SqliteCatalog` is a synchronous, rusqlite-backed port of the
+iceberg-rust SQL catalog's V1 schema. It stores table metadata pointers in SQLite
+and uses the supplied `StorageFactory` for table files. There is no SQLx pool,
+Tokio runtime, HTTP transport, or built-in object-store dependency in this path.
+
+The database file must exist before `load`; opening an existing binding never
+creates a new database at a mistyped path. The catalog initializes its V1 SQL
+tables. It does not migrate V0 catalogs. The name passed to `load` is the persistent
+`catalog_name`, not a process-local or PostgreSQL object identifier.
+
+A standalone bootstrap can use the existing local storage adapter:
+
+```rust,no_run
+use std::collections::HashMap;
+use std::sync::Arc;
+use iceberg_lite::{Catalog, CatalogBuilder, NamespaceIdent, TableIdent};
+use iceberg_lite::catalog::sqlite::SqliteCatalogBuilder;
+use iceberg_lite::io::{LocalStorage, Storage, StorageConfig, StorageFactory};
+
+#[derive(Debug)]
+struct LocalFactory;
+impl StorageFactory for LocalFactory {
+    fn build(&self, _config: StorageConfig) -> iceberg_lite::Result<Arc<dyn Storage>> {
+        Ok(Arc::new(LocalStorage))
+    }
+}
+
+# fn main() -> Result<(), Box<dyn std::error::Error>> {
+// First-time setup only; use an existing database for later connections.
+std::fs::OpenOptions::new().write(true).create_new(true)
+    .open("/data/iceberg/catalog.db")?;
+let catalog = SqliteCatalogBuilder::default()
+    .with_storage_factory(Arc::new(LocalFactory))
+    .load("local", HashMap::from([
+        ("uri".into(), "sqlite:/data/iceberg/catalog.db".into()),
+        ("warehouse".into(), "/data/iceberg/warehouse".into()),
+    ]))?;
+let namespace = NamespaceIdent::new("demo".into());
+catalog.create_namespace(&namespace, HashMap::new())?;
+catalog.register_table(
+    &TableIdent::new(namespace, "events".into()),
+    "/data/iceberg/warehouse/demo/events/metadata/00000-00000000-0000-0000-0000-000000000000.metadata.json".into(),
+)?;
+# Ok(())
+# }
+```
+
+Replace the metadata filename with the table's actual committed metadata file.
+Registration does not rewrite files or update another catalog's pointer. All
+writers must subsequently use the same SQLite database and catalog name.
+Alternatively, `Catalog::create_table` creates a new table using its explicit
+location, namespace location, or warehouse, in that order.
+
+`update_table` writes metadata and conditionally replaces the old pointer.
+`SqliteCatalog::prepare_transaction_commit` / `PreparedSqliteCommit::publish`
+split file materialization from atomic multi-table pointer publication for
+embedding applications. The prepared request owns a shared handle to its original
+catalog, so it can outlive the caller's catalog handle and cannot be redirected
+to another catalog at publication. It retains no SQLite lock between preparation
+and publication and does not retry or rebase a prepared batch. Files from rejected batches are left to the host's
+transaction cleanup or orphan maintenance.
+
+The catalog uses `synchronous=EXTRA` and disables SQLite busy sleeping. Busy
+errors propagate to the caller. This does not coordinate SQLite commits with an
+embedding database's transaction. The built-in local adapter syncs files at
+close without explicitly syncing parent directories, as with upstream's local
+streaming writer. It does not provide a separate directory-entry durability
+guarantee across OS crashes or power loss.
+
+Migration differences from upstream SQL catalog:
+
+- SQLite only, schema V1 only, synchronous connection protected by a mutex;
+  no multi-database placeholder rewriting, async pool, or V0 migration.
+- Prepared multi-table publication uses one SQLite transaction around all CAS
+  updates; file preparation is outside that transaction.
+- Namespace updates replace omitted properties as required by `Catalog`, while
+  retaining the SQL catalog's existence marker. Descendant listing preserves
+  upstream's full stored names but requires a namespace separator after the
+  parent prefix, so `ab` is not a descendant of `a`. Embedded-dot/empty components are
+  rejected instead of being stored under an ambiguous namespace key.
+- Direct parameterized queries avoid upstream's redundant existence query for
+  table loads and use affected-row counts for table deletion. Rename retains
+  upstream's source/namespace/destination error precedence, with all checks and
+  the update in one transaction. Namespace multi-statement mutations also execute
+  in SQLite transactions. Creation inserts
+  properties with a reused parameterized statement instead of building a
+  variable-length INSERT; the SQL result is unchanged.
+- URIs name absolute on-disk SQLite files without query/fragment options;
+  in-memory databases and unsafe journal modes are rejected. Durability and
+  nonblocking busy policy are explicit rather than inherited driver defaults.

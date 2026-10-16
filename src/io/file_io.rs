@@ -40,7 +40,7 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
     /// Called after a file has been fully written and closed.
     ///
     /// Object-storage backends use this to upload the staging file to the
-    /// remote store. Local backends can treat it as a no-op. Errors are
+    /// remote store. Errors are
     /// propagated to the caller so that network or backend failures are
     /// visible to the SQL statement that produced the file.
     fn finalize_write(&self, _path: &str) -> Result<()> {
@@ -331,8 +331,8 @@ impl OutputFile {
     }
 
     /// Notify the storage backend that the file has been fully written and
-    /// closed. Object-storage backends upload the staging file here; local
-    /// backends treat this as a no-op.
+    /// closed. Object-storage backends upload the staging file here;
+    /// the built-in local backend uses the default no-op.
     pub(crate) fn finalize_write(&self) -> crate::Result<()> {
         self.op.finalize_write(&self.path[self.relative_path_pos..])
     }

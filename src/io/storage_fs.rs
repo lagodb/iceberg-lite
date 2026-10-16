@@ -138,6 +138,7 @@ impl Write for LocalFileWrite {
 impl FileWrite for LocalFileWrite {
     fn close(&mut self) -> Result<()> {
         self.file.flush()?;
+        self.file.sync_all()?;
         Ok(())
     }
 }
