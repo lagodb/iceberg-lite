@@ -136,9 +136,11 @@ impl Write for LocalFileWrite {
 }
 
 impl FileWrite for LocalFileWrite {
-    fn close(&mut self) -> Result<()> {
+    fn close(&mut self) -> Result<FileMetadata> {
         self.file.flush()?;
         self.file.sync_all()?;
-        Ok(())
+        Ok(FileMetadata {
+            size: self.file.metadata()?.len(),
+        })
     }
 }

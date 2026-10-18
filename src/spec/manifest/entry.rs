@@ -22,7 +22,7 @@ use once_cell::sync::Lazy;
 use typed_builder::TypedBuilder;
 
 use crate::avro::schema_to_avro_schema;
-use crate::error::Result;
+use crate::error::{Result, invalid_data};
 use crate::spec::{
     DataContentType, DataFile, INITIAL_SEQUENCE_NUMBER, ListType, Literal,
     ManifestFile, MapType, NestedField, NestedFieldRef, PrimitiveLiteral,
@@ -234,10 +234,7 @@ impl TryFrom<i32> for ManifestStatus {
             0 => Ok(ManifestStatus::Existing),
             1 => Ok(ManifestStatus::Added),
             2 => Ok(ManifestStatus::Deleted),
-            _ => Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("manifest status {v} is invalid"),
-            )),
+            _ => Err(invalid_data!("manifest status {v} is invalid")),
         }
     }
 }

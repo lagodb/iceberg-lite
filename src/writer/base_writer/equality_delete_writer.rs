@@ -27,6 +27,7 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
 use crate::arrow::record_batch_projector::RecordBatchProjector;
 use crate::arrow::schema_to_arrow_schema;
+use crate::error::invalid_data;
 use crate::spec::{DataFile, PartitionKey, Schema, SchemaRef};
 use crate::writer::file_writer::FileWriterBuilder;
 use crate::writer::file_writer::location_generator::{
@@ -79,26 +80,21 @@ impl EqualityDeleteWriterConfig {
         original_schema: &Schema,
     ) -> Result<()> {
         if equality_ids.is_empty() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Equality delete field ids must not be empty.",
+            return Err(invalid_data!(
+                "Equality delete field ids must not be empty."
             ));
         }
 
         let mut seen = HashSet::with_capacity(equality_ids.len());
         for id in equality_ids {
             if !seen.insert(*id) {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Duplicate equality delete field id: {id}"),
+                return Err(invalid_data!(
+                    "Duplicate equality delete field id: {id}"
                 ));
             }
 
             if original_schema.field_by_id(*id).is_none() {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Invalid equality delete field id: {id}"),
-                ));
+                return Err(invalid_data!("Invalid equality delete field id: {id}"));
             }
         }
 
@@ -219,12 +215,8 @@ where
                         res.partition(pk.data().clone());
                         res.partition_spec_id(pk.spec().spec_id());
                     }
-                    res.build().map_err(|e| {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("Failed to build data file: {e}"),
-                        )
-                    })
+                    res.build()
+                        .map_err(|e| invalid_data!("Failed to build data file: {e}"))
                 })
                 .collect()
         } else {

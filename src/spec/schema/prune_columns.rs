@@ -16,6 +16,7 @@
 // under the License.
 
 use super::*;
+use crate::error::invalid_data;
 use crate::spec::VariantType;
 
 struct PruneColumn {
@@ -126,10 +127,8 @@ impl SchemaVisitor for PruneColumn {
             } else if !field.field_type.is_nested() {
                 Ok(Some(*field.field_type.clone()))
             } else {
-                Err(Error::new(
-                    ErrorKind::DataInvalid,
+                Err(invalid_data!(
                     "Can't project list or map field directly when not selecting full type."
-                        .to_string(),
                 )
                 .with_context("field_id", field.id.to_string())
                 .with_context("field_type", field.field_type.to_string()))
@@ -192,12 +191,10 @@ impl SchemaVisitor for PruneColumn {
             } else if list.element_field.field_type.is_primitive() {
                 Ok(Some(Type::List(list.clone())))
             } else {
-                Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Cannot explicitly project List or Map types, List element {} of type {} was selected",
-                        list.element_field.id, list.element_field.field_type
-                    ),
+                Err(invalid_data!(
+                    "Cannot explicitly project List or Map types, List element {} of type {} was selected",
+                    list.element_field.id,
+                    list.element_field.field_type
                 ))
             }
         } else if let Some(result) = value {
@@ -227,12 +224,10 @@ impl SchemaVisitor for PruneColumn {
             } else if map.value_field.field_type.is_primitive() {
                 Ok(Some(Type::Map(map.clone())))
             } else {
-                Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Cannot explicitly project List or Map types, Map value {} of type {} was selected",
-                        map.value_field.id, map.value_field.field_type
-                    ),
+                Err(invalid_data!(
+                    "Cannot explicitly project List or Map types, Map value {} of type {} was selected",
+                    map.value_field.id,
+                    map.value_field.field_type
                 ))
             }
         } else if let Some(value_result) = value {

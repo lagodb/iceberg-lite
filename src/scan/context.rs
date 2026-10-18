@@ -132,7 +132,7 @@ impl ManifestEntryContext {
         let deletes = index.get_deletes_for_data_file(
             self.manifest_entry.data_file(),
             self.manifest_entry.sequence_number(),
-        );
+        )?;
 
         let task = FileScanTask {
             file_size_in_bytes: self.manifest_entry.file_size_in_bytes(),

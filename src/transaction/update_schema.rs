@@ -25,13 +25,13 @@ use crate::spec::{
     Schema, SchemaId, StructType, TableMetadata, Type,
 };
 use crate::table::Table;
-use crate::transaction::action::{ActionCommit, TransactionAction};
+use crate::transaction::action::{ActionCommit, StatelessAction};
 use crate::{Error, ErrorKind, Result, TableRequirement, TableUpdate};
 
 const DEFAULT_FIELD_ID: i32 = 0;
 
 /// Declarative specification for adding a column in [`UpdateSchemaAction`].
-#[derive(TypedBuilder)]
+#[derive(Clone, TypedBuilder)]
 pub struct AddColumn {
     #[builder(default = None, setter(strip_option, into))]
     parent: Option<String>,
@@ -89,10 +89,12 @@ impl AddColumn {
 }
 
 /// Schema evolution API modeled after the Java `SchemaUpdate` implementation.
+#[derive(Clone)]
 pub struct UpdateSchemaAction {
     ops: Vec<SchemaUpdateIntent>,
 }
 
+#[derive(Clone)]
 enum SchemaUpdateIntent {
     Add(Box<AddColumn>),
     Delete { name: String },
@@ -841,14 +843,14 @@ impl PreparedSchemaUpdate {
     }
 }
 
-impl TransactionAction for UpdateSchemaAction {
-    fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+impl StatelessAction for UpdateSchemaAction {
+    fn commit(&self, table: &Table) -> Result<ActionCommit> {
         self.prepare(table)?.action_commit(table.metadata())
     }
 }
 
-impl TransactionAction for PreparedSchemaUpdate {
-    fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+impl StatelessAction for PreparedSchemaUpdate {
+    fn commit(&self, table: &Table) -> Result<ActionCommit> {
         self.action_commit(table.metadata())
     }
 }

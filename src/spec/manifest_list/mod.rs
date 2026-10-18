@@ -64,7 +64,9 @@ impl ManifestList {
     ) -> Result<ManifestList> {
         match version {
             FormatVersion::V1 => {
-                let reader = Reader::with_schema(&MANIFEST_LIST_AVRO_SCHEMA_V1, bs)?;
+                let reader = Reader::builder(bs)
+                    .reader_schema(&MANIFEST_LIST_AVRO_SCHEMA_V1)
+                    .build()?;
                 let values = Value::Array(
                     reader.collect::<std::result::Result<Vec<Value>, _>>()?,
                 );
@@ -572,11 +574,11 @@ mod test {
         writer
             .add_manifests(expected_manifest_list.entries.clone().into_iter())
             .unwrap();
-        writer.close().unwrap();
+        let saved_metadata = writer.close().unwrap();
 
         let encrypted_input = EncryptedInputFile::new(
             io.new_input(path.to_str().unwrap()).unwrap(),
-            key_metadata,
+            key_metadata.with_file_length(saved_metadata.size),
         );
         let bs = encrypted_input.read().unwrap();
         let manifest_list =

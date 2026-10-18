@@ -16,19 +16,20 @@
 // under the License.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use uuid::Uuid;
 
 use crate::error::Result;
 use crate::spec::{DataFile, ManifestEntry, ManifestFile, Operation};
 use crate::table::Table;
+use crate::transaction::action::CommitStatus;
 use crate::transaction::snapshot::{
     DefaultManifestProcess, SnapshotProduceOperation, SnapshotProducer,
 };
 use crate::transaction::{ActionCommit, TransactionAction};
 
 /// FastAppendAction is a transaction action for fast append data files to the table.
+#[derive(Clone)]
 pub struct FastAppendAction {
     check_duplicate: bool,
     // below are properties used to create SnapshotProducer when commit
@@ -102,7 +103,13 @@ impl FastAppendAction {
 }
 
 impl TransactionAction for FastAppendAction {
-    fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+    // TODO: replace with a persistent `SimpleSnapshotProducer` once snapshot
+    // production is migrated (stateful transaction RFC, milestone 2).
+    type State = ();
+
+    fn new_state(&self) -> Self::State {}
+
+    fn commit(&self, _state: &mut (), table: &Table) -> Result<ActionCommit> {
         let snapshot_producer = SnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),
@@ -119,6 +126,11 @@ impl TransactionAction for FastAppendAction {
         }
 
         snapshot_producer.commit(FastAppendOperation, DefaultManifestProcess)
+    }
+
+    fn cleanup(self, _state: (), _table: &Table, _status: CommitStatus) {
+        // Stateless for now: generated manifests are not yet tracked for
+        // terminal cleanup (stateful transaction RFC, milestone 2/3).
     }
 }
 
@@ -170,14 +182,14 @@ impl SnapshotProduceOperation for FastAppendOperation {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::Arc;
 
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, Literal, MAIN_BRANCH,
         ManifestContentType, ManifestFile, Struct,
     };
+    use crate::test_utils::commit_with_fresh_state;
+    use crate::transaction::Transaction;
     use crate::transaction::tests::make_v2_minimal_table;
-    use crate::transaction::{Transaction, TransactionAction};
     use crate::{TableRequirement, TableUpdate};
 
     fn manifest_with_counts(
@@ -219,7 +231,7 @@ mod tests {
         let table = make_v2_minimal_table();
         let tx = Transaction::new(&table);
         let action = tx.fast_append().add_data_files(vec![]);
-        assert!(Arc::new(action).commit(&table).is_err());
+        assert!(commit_with_fresh_state(action, &table).is_err());
     }
 
     #[test]
@@ -245,7 +257,7 @@ mod tests {
             .fast_append()
             .set_snapshot_properties(snapshot_properties)
             .add_data_files(vec![data_file]);
-        let mut action_commit = Arc::new(action).commit(&table).unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).unwrap();
         let updates = action_commit.take_updates();
 
         // Check customized properties is contained in snapshot summary properties.
@@ -276,7 +288,7 @@ mod tests {
         let action = tx
             .fast_append()
             .set_snapshot_properties(snapshot_properties);
-        let mut action_commit = Arc::new(action).commit(&table).unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).unwrap();
         let updates = action_commit.take_updates();
 
         // Check customized properties is contained in snapshot summary properties.
@@ -316,7 +328,7 @@ mod tests {
 
         let action = action.add_data_files(vec![data_file.clone()]);
 
-        assert!(Arc::new(action).commit(&table).is_err());
+        assert!(commit_with_fresh_state(action, &table).is_err());
     }
 
     #[test]
@@ -337,7 +349,7 @@ mod tests {
             .unwrap();
 
         let action = action.add_data_files(vec![data_file.clone()]);
-        let mut action_commit = Arc::new(action).commit(&table).unwrap();
+        let mut action_commit = commit_with_fresh_state(action, &table).unwrap();
         let updates = action_commit.take_updates();
         let requirements = action_commit.take_requirements();
 

@@ -271,6 +271,10 @@ impl Table {
         self.encryption_manager.as_deref()
     }
 
+    pub(crate) fn encryption_manager_ref(&self) -> Option<&Arc<EncryptionManager>> {
+        self.encryption_manager.as_ref()
+    }
+
     pub(crate) fn pending_encryption_keys(&self) -> Vec<EncryptedKey> {
         self.encryption_manager
             .as_ref()

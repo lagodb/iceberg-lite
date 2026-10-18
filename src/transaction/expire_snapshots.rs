@@ -16,15 +16,16 @@
 // under the License.
 
 use std::collections::HashSet;
-use std::sync::Arc;
 
 use chrono::Utc;
+
+use crate::error::invalid_data;
 
 use crate::spec::{
     MAIN_BRANCH, SnapshotReference, SnapshotRetention, TableMetadata, TableProperties,
 };
 use crate::table::Table;
-use crate::transaction::action::{ActionCommit, TransactionAction};
+use crate::transaction::action::{ActionCommit, StatelessAction};
 use crate::{Error, ErrorKind, Result, TableRequirement, TableUpdate};
 
 /// A transaction action that removes snapshots from table metadata.
@@ -37,6 +38,7 @@ use crate::{Error, ErrorKind, Result, TableRequirement, TableUpdate};
 /// is named explicitly or selected by age. Branch retention protects snapshots
 /// from age-based expiry, but does not protect snapshots named explicitly.
 /// Heads of retained refs, including the current snapshot, cannot be expired.
+#[derive(Clone)]
 pub struct ExpireSnapshotsAction {
     as_of_ms: i64,
     explicit_ids_to_remove: Vec<i64>,
@@ -101,9 +103,8 @@ impl ExpireSnapshotsAction {
         properties: &TableProperties<'_>,
     ) -> Result<ExpirePlan> {
         if self.retain_last == Some(0) {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Number of snapshots to retain must be at least 1",
+            return Err(invalid_data!(
+                "Number of snapshots to retain must be at least 1"
             ));
         }
         let max_snapshot_age_ms = properties.max_snapshot_age_ms()?;
@@ -342,10 +343,7 @@ impl ExpireSnapshotsAction {
 
     fn reference_error(metadata: &TableMetadata, snapshot_id: i64) -> Error {
         if metadata.current_snapshot_id() == Some(snapshot_id) {
-            return Error::new(
-                ErrorKind::DataInvalid,
-                "Cannot expire the current snapshot",
-            );
+            return invalid_data!("Cannot expire the current snapshot",);
         }
         let ref_names: Vec<&str> = metadata
             .refs
@@ -353,11 +351,8 @@ impl ExpireSnapshotsAction {
             .filter(|(_, snapshot_ref)| snapshot_ref.snapshot_id == snapshot_id)
             .map(|(ref_name, _)| ref_name.as_str())
             .collect();
-        Error::new(
-            ErrorKind::DataInvalid,
-            format!(
-                "Cannot expire snapshot {snapshot_id}: still referenced by {ref_names:?}"
-            ),
+        invalid_data!(
+            "Cannot expire snapshot {snapshot_id}: still referenced by {ref_names:?}"
         )
     }
 }
@@ -367,15 +362,14 @@ struct ExpirePlan {
     refs_to_remove: Vec<String>,
 }
 
-impl TransactionAction for ExpireSnapshotsAction {
-    fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+impl StatelessAction for ExpireSnapshotsAction {
+    fn commit(&self, table: &Table) -> Result<ActionCommit> {
         let metadata = table.metadata();
         let properties = metadata.table_properties();
 
         if !properties.gc_enabled()? {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Cannot expire snapshots: gc.enabled is false",
+            return Err(invalid_data!(
+                "Cannot expire snapshots: gc.enabled is false"
             ));
         }
 

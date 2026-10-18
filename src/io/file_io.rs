@@ -14,7 +14,7 @@ use super::{LocalStorage, MemoryStorage};
 ///
 /// Derives `Clone` and `Copy` so callers can read fields (e.g. `size`) before moving the
 /// struct into consumers like `ArrowFileReader::new()`.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 pub struct FileMetadata {
     pub size: u64,
 }
@@ -255,17 +255,17 @@ impl InputFile {
 /// standard Rust I/O operations while also supporting the `close` method
 /// for proper resource cleanup.
 pub trait FileWrite: std::io::Write + Send + Sync {
-    /// Close the writer's local handle.
+    /// Close the writer's local handle and return the stored file size.
     ///
     /// Implementations must make bytes accepted by prior `write` calls visible
     /// to the backend-specific finalization path. Durable local sync semantics
     /// are backend-specific and should be exposed through `Write::flush` when
     /// the backend supports them.
-    fn close(&mut self) -> Result<()>;
+    fn close(&mut self) -> Result<FileMetadata>;
 }
 
 impl FileWrite for Box<dyn FileWrite> {
-    fn close(&mut self) -> Result<()> {
+    fn close(&mut self) -> Result<FileMetadata> {
         self.as_mut().close()
     }
 }
@@ -305,7 +305,7 @@ impl OutputFile {
         use std::io::Write;
         let mut writer = self.create_writer()?;
         writer.write_all(bs)?;
-        writer.finish()
+        writer.finish().map(|_| ())
     }
 
     /// Create a writer whose [`OutputFileWriter::finish`] method completes the
@@ -320,6 +320,7 @@ impl OutputFile {
             },
             writer: Some(writer),
             local_closed: false,
+            saved_metadata: FileMetadata { size: 0 },
             close_failed: false,
             finished: false,
         })
@@ -351,6 +352,7 @@ pub struct OutputFileWriter {
     output_file: OutputFile,
     writer: Option<Box<dyn FileWrite>>,
     local_closed: bool,
+    saved_metadata: FileMetadata,
     close_failed: bool,
     finished: bool,
 }
@@ -358,7 +360,7 @@ pub struct OutputFileWriter {
 impl OutputFileWriter {
     /// Close the local writer if it is still open. This does not finalize the
     /// storage object and therefore does not upload object-storage staging files.
-    pub(crate) fn close_local(&mut self) -> crate::Result<()> {
+    pub(crate) fn close_local(&mut self) -> crate::Result<FileMetadata> {
         if self.close_failed {
             return Err(Error::new(
                 ErrorKind::Unexpected,
@@ -367,7 +369,7 @@ impl OutputFileWriter {
         }
 
         if self.local_closed {
-            return Ok(());
+            return Ok(self.saved_metadata);
         }
 
         let mut writer = self.writer.take().ok_or_else(|| {
@@ -378,7 +380,10 @@ impl OutputFileWriter {
         })?;
         self.local_closed = true;
         match writer.close() {
-            Ok(()) => Ok(()),
+            Ok(metadata) => {
+                self.saved_metadata = metadata;
+                Ok(metadata)
+            }
             Err(error) => {
                 self.close_failed = true;
                 Err(error)
@@ -390,7 +395,7 @@ impl OutputFileWriter {
     ///
     /// This first closes the local writer, then invokes storage finalization.
     /// Object-storage upload errors are returned to the caller from this method.
-    pub fn finish(&mut self) -> crate::Result<()> {
+    pub fn finish(&mut self) -> crate::Result<FileMetadata> {
         if self.finished {
             return Err(Error::new(
                 ErrorKind::Unexpected,
@@ -398,10 +403,10 @@ impl OutputFileWriter {
             ));
         }
 
-        self.close_local()?;
+        let metadata = self.close_local()?;
         self.output_file.finalize_write()?;
         self.finished = true;
-        Ok(())
+        Ok(metadata)
     }
 }
 
@@ -422,7 +427,7 @@ impl io::Write for OutputFileWriter {
 }
 
 impl FileWrite for OutputFileWriter {
-    fn close(&mut self) -> Result<()> {
+    fn close(&mut self) -> Result<FileMetadata> {
         self.finish()
     }
 }
@@ -507,7 +512,7 @@ mod tests {
     }
 
     impl FileWrite for FailingCloseWriter {
-        fn close(&mut self) -> Result<()> {
+        fn close(&mut self) -> Result<FileMetadata> {
             self.close_count.fetch_add(1, Ordering::SeqCst);
             Err(Error::new(ErrorKind::Unexpected, "close failed"))
         }
@@ -524,11 +529,11 @@ mod tests {
         let output_file = FileIO::new(storage).new_output("data/file").unwrap();
         let mut writer = output_file.create_writer().unwrap();
 
-        assert!(writer.finish().is_err());
+        assert!(writer.finish().map(|_| ()).is_err());
         assert_eq!(close_count.load(Ordering::SeqCst), 1);
         assert_eq!(finalize_count.load(Ordering::SeqCst), 0);
 
-        assert!(writer.finish().is_err());
+        assert!(writer.finish().map(|_| ()).is_err());
         drop(writer);
 
         assert_eq!(close_count.load(Ordering::SeqCst), 1);

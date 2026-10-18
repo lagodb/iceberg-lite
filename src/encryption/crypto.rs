@@ -28,6 +28,8 @@ use aes_gcm::{Aes128Gcm, Aes256Gcm, AesGcm, Nonce};
 
 type Aes192Gcm = AesGcm<aes_gcm::aes::Aes192, U12>;
 
+use crate::error::invalid_data;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum AesKeySize {
     #[default]
@@ -50,9 +52,8 @@ impl AesKeySize {
             16 => Ok(Self::Bits128),
             24 => Ok(Self::Bits192),
             32 => Ok(Self::Bits256),
-            _ => Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("Invalid data key length: {len} (must be 16, 24, or 32)"),
+            _ => Err(invalid_data!(
+                "Invalid data key length: {len} (must be 16, 24, or 32)"
             )),
         }
     }
@@ -66,10 +67,7 @@ impl FromStr for AesKeySize {
             "128" | "AES_GCM_128" | "AES128_GCM" => Ok(Self::Bits128),
             "192" | "AES_GCM_192" | "AES192_GCM" => Ok(Self::Bits192),
             "256" | "AES_GCM_256" | "AES256_GCM" => Ok(Self::Bits256),
-            _ => Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("Invalid AES key size: {s}"),
-            )),
+            _ => Err(invalid_data!("Invalid AES key size: {s}")),
         }
     }
 }
@@ -148,13 +146,10 @@ impl AesGcmCipher {
 
     pub fn decrypt(&self, ciphertext: &[u8], aad: Option<&[u8]>) -> Result<Vec<u8>> {
         if ciphertext.len() < Self::NONCE_LEN + Self::TAG_LEN {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Ciphertext too short: expected at least {} bytes, got {}",
-                    Self::NONCE_LEN + Self::TAG_LEN,
-                    ciphertext.len()
-                ),
+            return Err(invalid_data!(
+                "Ciphertext too short: expected at least {} bytes, got {}",
+                Self::NONCE_LEN + Self::TAG_LEN,
+                ciphertext.len()
             ));
         }
 
@@ -181,8 +176,7 @@ where
     C: Aead + AeadCore + KeyInit,
 {
     let cipher = C::new_from_slice(key_bytes).map_err(|e| {
-        Error::new(ErrorKind::DataInvalid, "Invalid AES key")
-            .with_source(anyhow::anyhow!(e))
+        invalid_data!("Invalid AES key").with_source(anyhow::anyhow!(e))
     })?;
     let nonce = C::generate_nonce(&mut OsRng);
 
@@ -217,8 +211,7 @@ where
     C: Aead + AeadCore + KeyInit,
 {
     let cipher = C::new_from_slice(key_bytes).map_err(|e| {
-        Error::new(ErrorKind::DataInvalid, "Invalid AES key")
-            .with_source(anyhow::anyhow!(e))
+        invalid_data!("Invalid AES key").with_source(anyhow::anyhow!(e))
     })?;
 
     let nonce = Nonce::from_slice(&ciphertext[..AesGcmCipher::NONCE_LEN]);

@@ -6,7 +6,6 @@
 //! time a catalog retry replays the action.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use uuid::Uuid;
 
@@ -16,10 +15,11 @@ use crate::table::Table;
 use crate::transaction::snapshot_delta::{
     CurrentSnapshotInventory, DeltaCommitSemantics, DeltaPlan, DeltaSnapshotProducer,
 };
-use crate::transaction::{ActionCommit, TransactionAction};
+use crate::transaction::{ActionCommit, StatelessAction};
 use crate::{Error, ErrorKind, Result};
 
 /// A fixed-input file rewrite planned from one starting snapshot.
+#[derive(Clone)]
 pub struct RewriteFilesAction {
     starting_snapshot_id: i64,
     starting_sequence_number: i64,
@@ -334,8 +334,8 @@ impl RewriteFilesAction {
     }
 }
 
-impl TransactionAction for RewriteFilesAction {
-    fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+impl StatelessAction for RewriteFilesAction {
+    fn commit(&self, table: &Table) -> Result<ActionCommit> {
         self.validate_definition()?;
         let plan = self.delta_plan()?;
         let inventory = self.validate_current_table(table, &plan.removals)?;

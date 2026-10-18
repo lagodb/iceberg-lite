@@ -80,7 +80,7 @@ use crate::overlay::SnapshotDelta;
 pub use crate::spec::IsolationLevel;
 use crate::spec::TableProperties;
 use crate::table::Table;
-use crate::transaction::action::BoxedTransactionAction;
+use crate::transaction::action::TransactionActionEntry;
 use crate::transaction::append::FastAppendAction;
 use crate::transaction::expire_snapshots::ExpireSnapshotsAction;
 pub use crate::transaction::rewrite_files::RewriteFilesAction;
@@ -98,10 +98,9 @@ use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
 use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
 
 /// Table transaction.
-#[derive(Clone)]
 pub struct Transaction {
     table: Table,
-    actions: Vec<BoxedTransactionAction>,
+    actions: Vec<TransactionActionEntry>,
 }
 
 impl Transaction {
@@ -293,8 +292,8 @@ impl Transaction {
         let mut existing_updates: Vec<TableUpdate> = vec![];
         let mut existing_requirements: Vec<TableRequirement> = vec![];
 
-        for action in &self.actions {
-            let action_commit = Arc::clone(action).commit(&current_table)?;
+        for entry in self.actions.iter_mut() {
+            let action_commit = entry.commit(&current_table)?;
             if action_commit.is_empty() {
                 continue;
             }

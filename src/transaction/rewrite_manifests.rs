@@ -5,16 +5,16 @@
 //! data-file rewrite without exposing an intermediate table pointer.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use uuid::Uuid;
 
 use crate::Result;
 use crate::table::Table;
 use crate::transaction::snapshot_delta::DeltaSnapshotProducer;
-use crate::transaction::{ActionCommit, TransactionAction};
+use crate::transaction::{ActionCommit, StatelessAction};
 
 /// Rewrites selected live manifests without changing the live content-file set.
+#[derive(Clone)]
 pub struct RewriteManifestsAction {
     min_count_to_merge: usize,
     target_size_bytes: u64,
@@ -36,8 +36,8 @@ impl RewriteManifestsAction {
     }
 }
 
-impl TransactionAction for RewriteManifestsAction {
-    fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+impl StatelessAction for RewriteManifestsAction {
+    fn commit(&self, table: &Table) -> Result<ActionCommit> {
         let mut producer = DeltaSnapshotProducer::new(
             table,
             self.commit_uuid.unwrap_or_else(Uuid::now_v7),

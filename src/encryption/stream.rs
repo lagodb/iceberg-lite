@@ -24,7 +24,8 @@ use std::sync::Arc;
 use bytes::{Bytes, BytesMut};
 
 use super::AesGcmCipher;
-use crate::io::{FileRead, FileWrite};
+use crate::error::invalid_data;
+use crate::io::{FileMetadata, FileRead, FileWrite};
 use crate::{Error, ErrorKind, Result};
 
 pub const PLAIN_BLOCK_SIZE: u32 = 1024 * 1024;
@@ -33,6 +34,8 @@ pub const GCM_TAG_LENGTH: u32 = 16;
 pub const CIPHER_BLOCK_SIZE: u32 = PLAIN_BLOCK_SIZE + NONCE_LENGTH + GCM_TAG_LENGTH;
 pub const GCM_STREAM_MAGIC: [u8; 4] = *b"AGS1";
 pub const GCM_STREAM_HEADER_LENGTH: u32 = 8;
+pub(crate) const MIN_STREAM_LENGTH: u32 =
+    GCM_STREAM_HEADER_LENGTH + NONCE_LENGTH + GCM_TAG_LENGTH;
 
 pub(crate) fn stream_block_aad(aad_prefix: &[u8], block_index: u32) -> Vec<u8> {
     let index_bytes = block_index.to_le_bytes();
@@ -66,18 +69,6 @@ impl AesGcmFileRead {
         let plain_stream_size =
             Self::calculate_plaintext_length(encrypted_file_length)?;
         let stream_length = encrypted_file_length - GCM_STREAM_HEADER_LENGTH as u64;
-
-        if stream_length == 0 {
-            return Ok(Self {
-                inner,
-                cipher,
-                aad_prefix,
-                plain_stream_size: 0,
-                num_blocks: 0,
-                last_cipher_block_size: 0,
-                position: 0,
-            });
-        }
 
         let num_full_blocks = stream_length / CIPHER_BLOCK_SIZE as u64;
         let cipher_bytes_in_last_block =
@@ -122,20 +113,16 @@ impl AesGcmFileRead {
     }
 
     pub fn calculate_plaintext_length(encrypted_file_length: u64) -> Result<u64> {
-        if encrypted_file_length < GCM_STREAM_HEADER_LENGTH as u64 {
+        if encrypted_file_length < u64::from(MIN_STREAM_LENGTH) {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!(
-                    "Encrypted file too short: {encrypted_file_length} bytes (minimum {GCM_STREAM_HEADER_LENGTH})"
+                    "Encrypted file too short: {encrypted_file_length} bytes (minimum {MIN_STREAM_LENGTH})"
                 ),
             ));
         }
 
         let stream_length = encrypted_file_length - GCM_STREAM_HEADER_LENGTH as u64;
-
-        if stream_length == 0 {
-            return Ok(0);
-        }
 
         let num_full_blocks = stream_length / CIPHER_BLOCK_SIZE as u64;
         let cipher_bytes_in_last_block = stream_length % CIPHER_BLOCK_SIZE as u64;
@@ -175,7 +162,7 @@ impl AesGcmFileRead {
 
 impl FileRead for AesGcmFileRead {
     fn read_range(&self, range: Range<u64>) -> Result<Bytes> {
-        if range.start == range.end {
+        if range.start == range.end && self.plain_stream_size != 0 {
             return Ok(Bytes::new());
         }
 
@@ -199,17 +186,20 @@ impl FileRead for AesGcmFileRead {
             ));
         }
 
-        if self.num_blocks == 0 {
-            return Ok(Bytes::new());
-        }
-
         let first_block = range.start / PLAIN_BLOCK_SIZE as u64;
-        let last_block = (range.end - 1) / PLAIN_BLOCK_SIZE as u64;
+        let last_block = range.end.saturating_sub(1) / PLAIN_BLOCK_SIZE as u64;
         let encrypted_start = Self::encrypted_block_offset(first_block);
         let encrypted_end = Self::encrypted_block_offset(last_block)
             + self.cipher_block_size(last_block) as u64;
 
         let all_encrypted = self.inner.read_range(encrypted_start..encrypted_end)?;
+        if all_encrypted.len() as u64 != encrypted_end - encrypted_start {
+            return Err(invalid_data!(
+                "Invalid encrypted read length: expected {} bytes, got {}",
+                encrypted_end - encrypted_start,
+                all_encrypted.len()
+            ));
+        }
 
         let result_len = (range.end - range.start) as usize;
         let mut result = BytesMut::with_capacity(result_len);
@@ -218,13 +208,6 @@ impl FileRead for AesGcmFileRead {
         for block_idx in first_block..=last_block {
             let block_size = self.cipher_block_size(block_idx) as usize;
             let end = encrypted_offset + block_size;
-            if end > all_encrypted.len() {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Encrypted AGS1 block read returned fewer bytes than expected",
-                ));
-            }
-
             let cipher_block = &all_encrypted[encrypted_offset..end];
             encrypted_offset = end;
 
@@ -417,7 +400,7 @@ impl Write for AesGcmFileWrite {
 }
 
 impl FileWrite for AesGcmFileWrite {
-    fn close(&mut self) -> Result<()> {
+    fn close(&mut self) -> Result<FileMetadata> {
         if self.closed {
             return Err(Error::new(
                 ErrorKind::Unexpected,
@@ -510,8 +493,10 @@ mod tests {
     }
 
     impl FileWrite for VecFileWrite {
-        fn close(&mut self) -> Result<()> {
-            Ok(())
+        fn close(&mut self) -> Result<FileMetadata> {
+            Ok(FileMetadata {
+                size: self.0.lock().unwrap().len() as u64,
+            })
         }
     }
 

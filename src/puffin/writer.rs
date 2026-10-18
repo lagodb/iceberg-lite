@@ -20,7 +20,7 @@ use std::collections::{HashMap, HashSet};
 use crate::Result;
 use crate::compression::CompressionCodec;
 use crate::encryption::EncryptedOutputFile;
-use crate::io::{FileWrite, OutputFile};
+use crate::io::{FileMetadata as IoFileMetadata, FileWrite, OutputFile};
 use crate::puffin::blob::Blob;
 use crate::puffin::metadata::{BlobMetadata, FileMetadata, Flag};
 use crate::puffin::validate_puffin_compression;
@@ -121,7 +121,7 @@ impl PuffinWriter {
     }
 
     /// Finalizes the Puffin file
-    pub fn close(mut self) -> Result<()> {
+    pub fn close(mut self) -> Result<IoFileMetadata> {
         self.write_header_once()?;
         self.write_footer()?;
         self.writer.close()

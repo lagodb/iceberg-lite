@@ -893,10 +893,11 @@ mod tests {
             PartitionSpec::builder(schema.clone())
                 .add_unbound_fields(vec![
                     UnboundPartitionField::builder()
-                        .source_id(2)
+                        .source_ids(vec![2])
                         .name("year".to_string())
                         .transform(Transform::Identity)
-                        .build(),
+                        .build()
+                        .unwrap(),
                 ])
                 .unwrap()
                 .with_spec_id(1)
@@ -1053,10 +1054,11 @@ mod tests {
             PartitionSpec::builder(schema.clone())
                 .add_unbound_fields(vec![
                     UnboundPartitionField::builder()
-                        .source_id(2)
+                        .source_ids(vec![2])
                         .name("year".to_string())
                         .transform(Transform::Identity)
-                        .build(),
+                        .build()
+                        .unwrap(),
                 ])
                 .unwrap()
                 .with_spec_id(1)
@@ -1311,5 +1313,29 @@ mod tests {
         assert_eq!(props.get(TOTAL_FILE_SIZE).unwrap(), "800");
         assert_eq!(props.get(TOTAL_POSITION_DELETES).unwrap(), "2");
         assert_eq!(props.get(TOTAL_EQUALITY_DELETES).unwrap(), "1");
+    }
+
+    #[test]
+    fn test_update_totals_omits_total_when_removed_exceeds_previous_total() {
+        let previous_summary = Summary {
+            operation: Operation::Append,
+            additional_properties: HashMap::from([(
+                TOTAL_DATA_FILES.to_string(),
+                "2".to_string(),
+            )]),
+        };
+        let summary = Summary {
+            operation: Operation::Delete,
+            additional_properties: HashMap::from([(
+                DELETED_DATA_FILES.to_string(),
+                "3".to_string(),
+            )]),
+        };
+
+        let updated =
+            update_snapshot_summaries(summary, Some(&previous_summary), false)
+                .unwrap();
+
+        assert!(!updated.additional_properties.contains_key(TOTAL_DATA_FILES));
     }
 }

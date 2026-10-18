@@ -26,8 +26,9 @@ use typed_builder::TypedBuilder;
 
 use super::transform::Transform;
 use super::{NestedField, PrimitiveType, Schema, SchemaRef, StructType};
+use crate::Result;
+use crate::error::invalid_data;
 use crate::spec::Struct;
-use crate::{Error, ErrorKind, Result};
 
 pub(crate) const UNPARTITIONED_LAST_ASSIGNED_ID: i32 = 999;
 pub(crate) const DEFAULT_PARTITION_SPEC_ID: i32 = 0;
@@ -267,20 +268,157 @@ impl PartitionKey {
 /// Reference to [`UnboundPartitionSpec`].
 pub type UnboundPartitionSpecRef = Arc<UnboundPartitionSpec>;
 /// Unbound partition field can be built without a schema and later bound to a schema.
+///
+/// The fields are private so that an instance is always well formed: in particular
+/// `source_ids` holds at least one id, which [`UnboundPartitionField::builder`] checks when the
+/// field is built.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone, TypedBuilder)]
-#[serde(rename_all = "kebab-case")]
+#[serde(
+    try_from = "self::_serde::UnboundPartitionFieldSerde",
+    into = "self::_serde::UnboundPartitionFieldSerde"
+)]
+#[builder(build_method(into = Result<UnboundPartitionField>))]
 pub struct UnboundPartitionField {
-    /// A source column id from the table’s schema
-    pub source_id: i32,
+    /// The source column ids from the table’s schema. A single-argument transform reads one
+    /// id; a v3 multi-argument transform reads several.
+    source_ids: Vec<i32>,
     /// A partition field id that is used to identify a partition field and is unique within a partition spec.
     /// In v2 table metadata, it is unique across all partition specs.
     #[builder(default, setter(strip_option(fallback = field_id_opt)))]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub field_id: Option<i32>,
+    field_id: Option<i32>,
     /// A partition name.
-    pub name: String,
+    #[builder(setter(into))]
+    name: String,
     /// A transform that is applied to the source column to produce a partition value.
-    pub transform: Transform,
+    transform: Transform,
+}
+
+impl UnboundPartitionField {
+    /// The single source column id this field reads.
+    ///
+    /// Returns an error for a multi-argument field, which reads several columns and therefore
+    /// has no single source id. Use [`Self::source_ids`] to handle both shapes.
+    pub fn source_id(&self) -> Result<i32> {
+        match self.source_ids.as_slice() {
+            [source_id] => Ok(*source_id),
+            source_ids => Err(invalid_data!(
+                "Partition field '{}' reads {} source columns and has no single source id",
+                self.name,
+                source_ids.len()
+            )),
+        }
+    }
+
+    /// The source column ids this field reads, in order. Never empty.
+    pub fn source_ids(&self) -> &[i32] {
+        &self.source_ids
+    }
+
+    /// The partition field id, when one was assigned.
+    pub fn field_id(&self) -> Option<i32> {
+        self.field_id
+    }
+
+    /// The partition name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The transform applied to the source columns to produce a partition value.
+    pub fn transform(&self) -> Transform {
+        self.transform
+    }
+
+    /// Return this field with the given partition field id assigned.
+    pub fn with_field_id(self, field_id: i32) -> Self {
+        Self {
+            field_id: Some(field_id),
+            ..self
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        if self.source_ids.is_empty() {
+            return Err(invalid_data!("Empty source-ids is not allowed"));
+        }
+        Ok(())
+    }
+}
+
+impl From<UnboundPartitionField> for Result<UnboundPartitionField> {
+    fn from(field: UnboundPartitionField) -> Self {
+        field.validate()?;
+        Ok(field)
+    }
+}
+
+mod _serde {
+    use serde::{Deserialize, Serialize};
+
+    use super::UnboundPartitionField;
+    use crate::Error;
+    use crate::error::invalid_data;
+    use crate::spec::Transform;
+
+    /// Per the spec a single-argument field carries `source-id` and a multi-argument field
+    /// carries `source-ids`. Either spelling is read, but not both at once; the one that
+    /// matches the field is written.
+    #[derive(Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub(super) struct UnboundPartitionFieldSerde {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_id: Option<i32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source_ids: Option<Vec<i32>>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        field_id: Option<i32>,
+        name: String,
+        transform: Transform,
+    }
+
+    impl TryFrom<UnboundPartitionFieldSerde> for UnboundPartitionField {
+        type Error = Error;
+
+        fn try_from(value: UnboundPartitionFieldSerde) -> Result<Self, Error> {
+            let source_ids = match (value.source_id, value.source_ids) {
+                (Some(source_id), None) => vec![source_id],
+                (None, Some(source_ids)) => source_ids,
+                (Some(_), Some(_)) => {
+                    return Err(invalid_data!(
+                        "source-id and source-ids are mutually exclusive"
+                    ));
+                }
+                (None, None) => {
+                    return Err(invalid_data!(
+                        "Either `source-id` or `source-ids` must be present"
+                    ));
+                }
+            };
+
+            UnboundPartitionField::builder()
+                .source_ids(source_ids)
+                .field_id_opt(value.field_id)
+                .name(value.name)
+                .transform(value.transform)
+                .build()
+        }
+    }
+
+    impl From<UnboundPartitionField> for UnboundPartitionFieldSerde {
+        fn from(value: UnboundPartitionField) -> Self {
+            let (source_id, source_ids) = match value.source_ids.as_slice() {
+                [source_id] => (Some(*source_id), None),
+                _ => (None, Some(value.source_ids)),
+            };
+            Self {
+                source_id,
+                source_ids,
+                field_id: value.field_id,
+                name: value.name,
+                transform: value.transform,
+            }
+        }
+    }
 }
 
 /// Unbound partition spec can be built without a schema and later bound to a schema.
@@ -344,7 +482,7 @@ fn has_sequential_ids(field_ids: impl Iterator<Item = i32>) -> bool {
 impl From<PartitionField> for UnboundPartitionField {
     fn from(field: PartitionField) -> Self {
         UnboundPartitionField {
-            source_id: field.source_id,
+            source_ids: vec![field.source_id],
             field_id: Some(field.field_id),
             name: field.name,
             transform: field.transform,
@@ -385,18 +523,16 @@ impl UnboundPartitionSpecBuilder {
 
     /// Add a new partition field to the partition spec from an unbound partition field.
     pub fn add_partition_field(
-        self,
-        source_id: i32,
-        target_name: impl ToString,
-        transformation: Transform,
+        mut self,
+        field: UnboundPartitionField,
     ) -> Result<Self> {
-        let field = UnboundPartitionField {
-            source_id,
-            field_id: None,
-            name: target_name.to_string(),
-            transform: transformation,
-        };
-        self.add_partition_field_internal(field)
+        self.check_name_set_and_unique(&field.name)?;
+        self.check_for_redundant_partitions(&field.source_ids, &field.transform)?;
+        if let Some(partition_field_id) = field.field_id {
+            self.check_partition_id_unique(partition_field_id)?;
+        }
+        self.fields.push(field);
+        Ok(self)
     }
 
     /// Add multiple partition fields to the partition spec.
@@ -406,22 +542,9 @@ impl UnboundPartitionSpecBuilder {
     ) -> Result<Self> {
         let mut builder = self;
         for field in fields {
-            builder = builder.add_partition_field_internal(field)?;
+            builder = builder.add_partition_field(field)?;
         }
         Ok(builder)
-    }
-
-    fn add_partition_field_internal(
-        mut self,
-        field: UnboundPartitionField,
-    ) -> Result<Self> {
-        self.check_name_set_and_unique(&field.name)?;
-        self.check_for_redundant_partitions(field.source_id, &field.transform)?;
-        if let Some(partition_field_id) = field.field_id {
-            self.check_partition_id_unique(partition_field_id)?;
-        }
-        self.fields.push(field);
-        Ok(self)
     }
 
     /// Build the unbound partition spec.
@@ -497,17 +620,14 @@ impl PartitionSpecBuilder {
             .schema
             .field_by_name(source_name.as_ref())
             .ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Cannot find source column with name: {} in schema",
-                        source_name.as_ref()
-                    ),
+                invalid_data!(
+                    "Cannot find source column with name: {} in schema",
+                    source_name.as_ref()
                 )
             })?
             .id;
         let field = UnboundPartitionField {
-            source_id,
+            source_ids: vec![source_id],
             field_id: None,
             name: target_name.into(),
             transform,
@@ -522,7 +642,7 @@ impl PartitionSpecBuilder {
     /// Otherwise, a new `field_id` is assigned.
     pub fn add_unbound_field(mut self, field: UnboundPartitionField) -> Result<Self> {
         self.check_name_set_and_unique(&field.name)?;
-        self.check_for_redundant_partitions(field.source_id, &field.transform)?;
+        self.check_for_redundant_partitions(&field.source_ids, &field.transform)?;
         Self::check_name_does_not_collide_with_schema(&field, &self.schema)?;
         Self::check_transform_compatibility(&field, &self.schema)?;
         if let Some(partition_field_id) = field.field_id {
@@ -569,10 +689,7 @@ impl PartitionSpecBuilder {
 
         fn _check_add_1(prev: i32) -> Result<i32> {
             prev.checked_add(1).ok_or_else(|| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    "Cannot assign more partition ids. Overflow.",
-                )
+                invalid_data!("Cannot assign more partition ids. Overflow.")
             })
         }
 
@@ -592,7 +709,7 @@ impl PartitionSpecBuilder {
             };
 
             bound_fields.push(PartitionField {
-                source_id: field.source_id,
+                source_id: field.source_id()?,
                 field_id: partition_field_id,
                 name: field.name,
                 transform: field.transform,
@@ -613,24 +730,20 @@ impl PartitionSpecBuilder {
         match schema.field_by_name(field.name.as_str()) {
             Some(schema_collision) => {
                 if field.transform == Transform::Identity {
-                    if schema_collision.id == field.source_id {
+                    if schema_collision.id == field.source_id()? {
                         Ok(())
                     } else {
-                        Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Cannot create identity partition sourced from different field in schema. Field name '{}' has id `{}` in schema but partition source id is `{}`",
-                                field.name, schema_collision.id, field.source_id
-                            ),
+                        Err(invalid_data!(
+                            "Cannot create identity partition sourced from different field in schema. Field name '{}' has id `{}` in schema but partition source id is `{}`",
+                            field.name,
+                            schema_collision.id,
+                            field.source_id()?
                         ))
                     }
                 } else {
-                    Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Cannot create partition with name: '{}' that conflicts with schema field and is not an identity transform.",
-                            field.name
-                        ),
+                    Err(invalid_data!(
+                        "Cannot create partition with name: '{}' that conflicts with schema field and is not an identity transform.",
+                        field.name
                     ))
                 }
             }
@@ -644,24 +757,20 @@ impl PartitionSpecBuilder {
         field: &UnboundPartitionField,
         schema: &Schema,
     ) -> Result<()> {
-        let schema_field = schema.field_by_id(field.source_id).ok_or_else(|| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Cannot find partition source field with id `{}` in schema",
-                    field.source_id
-                ),
+        // A multi-argument field is rejected here on purpose: a bound `PartitionField` has
+        // no place for more than one source id yet.
+        let source_id = field.source_id()?;
+        let schema_field = schema.field_by_id(source_id).ok_or_else(|| {
+            invalid_data!(
+                "Cannot find partition source field with id `{source_id}` in schema"
             )
         })?;
 
         if field.transform != Transform::Void {
             if !schema_field.field_type.is_primitive() {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Cannot partition by non-primitive source field: '{}'.",
-                        schema_field.field_type
-                    ),
+                return Err(invalid_data!(
+                    "Cannot partition by non-primitive source field: '{}'.",
+                    schema_field.field_type
                 ));
             }
 
@@ -670,13 +779,10 @@ impl PartitionSpecBuilder {
                 .result_type(&schema_field.field_type)
                 .is_err()
             {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    format!(
-                        "Invalid source type: '{}' for transform: '{}'.",
-                        schema_field.field_type,
-                        field.transform.dedup_name()
-                    ),
+                return Err(invalid_data!(
+                    "Invalid source type: '{}' for transform: '{}'.",
+                    schema_field.field_type,
+                    field.transform.dedup_name()
                 ));
             }
         }
@@ -690,16 +796,12 @@ trait CorePartitionSpecValidator {
     /// Ensure that the partition name is unique among the partition fields and is not empty.
     fn check_name_set_and_unique(&self, name: &str) -> Result<()> {
         if name.is_empty() {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Cannot use empty partition name",
-            ));
+            return Err(invalid_data!("Cannot use empty partition name"));
         }
 
         if self.fields().iter().any(|f| f.name == name) {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("Cannot use partition name more than once: {name}"),
+            return Err(invalid_data!(
+                "Cannot use partition name more than once: {name}"
             ));
         }
         Ok(())
@@ -708,23 +810,20 @@ trait CorePartitionSpecValidator {
     /// For a single source-column transformations must be unique.
     fn check_for_redundant_partitions(
         &self,
-        source_id: i32,
+        source_ids: &[i32],
         transform: &Transform,
     ) -> Result<()> {
         let collision = self.fields().iter().find(|f| {
-            f.source_id == source_id
+            f.source_ids == source_ids
                 && f.transform.dedup_name() == transform.dedup_name()
         });
 
         if let Some(collision) = collision {
-            Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Cannot add redundant partition with source id `{}` and transform `{}`. A partition with the same source id and transform already exists with name `{}`",
-                    source_id,
-                    transform.dedup_name(),
-                    collision.name
-                ),
+            Err(invalid_data!(
+                "Cannot add redundant partition with source ids `{:?}` and transform `{}`. A partition with the same source ids and transform already exists with name `{}`",
+                source_ids,
+                transform.dedup_name(),
+                collision.name
             ))
         } else {
             Ok(())
@@ -734,11 +833,8 @@ trait CorePartitionSpecValidator {
     /// Check field / partition_id unique within the partition spec if set
     fn check_partition_id_unique(&self, field_id: i32) -> Result<()> {
         if self.fields().iter().any(|f| f.field_id == Some(field_id)) {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Cannot use field id more than once in one PartitionSpec: {field_id}"
-                ),
+            return Err(invalid_data!(
+                "Cannot use field id more than once in one PartitionSpec: {field_id}"
             ));
         }
 
@@ -763,6 +859,7 @@ impl CorePartitionSpecValidator for UnboundPartitionSpecBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ErrorKind;
     use crate::spec::{Literal, PrimitiveType, Type};
 
     #[test]
@@ -837,15 +934,17 @@ mod tests {
         let partition_spec = PartitionSpec::builder(schema.clone())
             .add_unbound_fields(vec![
                 UnboundPartitionField::builder()
-                    .source_id(1)
+                    .source_ids(vec![1])
                     .name("id".to_string())
                     .transform(Transform::Identity)
-                    .build(),
+                    .build()
+                    .unwrap(),
                 UnboundPartitionField::builder()
-                    .source_id(2)
+                    .source_ids(vec![2])
                     .name("name_string".to_string())
                     .transform(Transform::Void)
-                    .build(),
+                    .build()
+                    .unwrap(),
             ])
             .unwrap()
             .with_spec_id(1)
@@ -860,15 +959,17 @@ mod tests {
             .with_spec_id(1)
             .add_unbound_fields(vec![
                 UnboundPartitionField::builder()
-                    .source_id(1)
+                    .source_ids(vec![1])
                     .name("id_void".to_string())
                     .transform(Transform::Void)
-                    .build(),
+                    .build()
+                    .unwrap(),
                 UnboundPartitionField::builder()
-                    .source_id(2)
+                    .source_ids(vec![2])
                     .name("name_void".to_string())
                     .transform(Transform::Void)
-                    .build(),
+                    .build()
+                    .unwrap(),
             ])
             .unwrap()
             .build()
@@ -907,17 +1008,17 @@ mod tests {
             serde_json::from_str(spec).unwrap();
         assert_eq!(Some(1), partition_spec.spec_id);
 
-        assert_eq!(4, partition_spec.fields[0].source_id);
+        assert_eq!(4, partition_spec.fields[0].source_id().unwrap());
         assert_eq!(Some(1000), partition_spec.fields[0].field_id);
         assert_eq!("ts_day", partition_spec.fields[0].name);
         assert_eq!(Transform::Day, partition_spec.fields[0].transform);
 
-        assert_eq!(1, partition_spec.fields[1].source_id);
+        assert_eq!(1, partition_spec.fields[1].source_id().unwrap());
         assert_eq!(Some(1001), partition_spec.fields[1].field_id);
         assert_eq!("id_bucket", partition_spec.fields[1].name);
         assert_eq!(Transform::Bucket(16), partition_spec.fields[1].transform);
 
-        assert_eq!(2, partition_spec.fields[2].source_id);
+        assert_eq!(2, partition_spec.fields[2].source_id().unwrap());
         assert_eq!(Some(1002), partition_spec.fields[2].field_id);
         assert_eq!("id_truncate", partition_spec.fields[2].name);
         assert_eq!(Transform::Truncate(4), partition_spec.fields[2].transform);
@@ -935,7 +1036,7 @@ mod tests {
             serde_json::from_str(spec).unwrap();
         assert_eq!(None, partition_spec.spec_id);
 
-        assert_eq!(4, partition_spec.fields[0].source_id);
+        assert_eq!(4, partition_spec.fields[0].source_id().unwrap());
         assert_eq!(None, partition_spec.fields[0].field_id);
         assert_eq!("ts_day", partition_spec.fields[0].name);
         assert_eq!(Transform::Day, partition_spec.fields[0].transform);
@@ -944,7 +1045,14 @@ mod tests {
     #[test]
     fn test_unbound_partition_spec_serialization_skips_none_fields() {
         let spec = UnboundPartitionSpec::builder()
-            .add_partition_field(4, "ts_day".to_string(), Transform::Day)
+            .add_partition_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![4])
+                    .name("ts_day")
+                    .transform(Transform::Day)
+                    .build()
+                    .unwrap(),
+            )
             .unwrap()
             .build();
 
@@ -1155,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn test_partition_error() {
+    fn test_partition_type_with_dropped_source_column() {
         let spec = r#"
         {
         "spec-id": 1,
@@ -1181,44 +1289,118 @@ mod tests {
         let partition_spec: PartitionSpec = serde_json::from_str(spec).unwrap();
         let schema = Schema::builder()
             .with_fields(vec![
-                NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(crate::spec::PrimitiveType::Int),
-                )
-                .into(),
-                NestedField::required(
-                    2,
-                    "name",
-                    Type::Primitive(crate::spec::PrimitiveType::String),
-                )
-                .into(),
+                NestedField::required(1, "id", PrimitiveType::Int.into()).into(),
+                NestedField::required(2, "name", PrimitiveType::String.into()).into(),
             ])
             .build()
             .unwrap();
 
-        let partition_type = partition_spec.partition_type(&schema).unwrap();
-        let field_types: Vec<_> = partition_type
-            .fields()
-            .iter()
-            .map(|field| field.field_type.as_ref().clone())
-            .collect();
         assert_eq!(
-            field_types,
-            vec![
-                Type::Primitive(PrimitiveType::Date),
-                Type::Primitive(PrimitiveType::Int),
-                Type::Primitive(PrimitiveType::String),
-            ]
+            partition_spec.partition_type(&schema).unwrap(),
+            StructType::new(vec![
+                NestedField::optional(1000, "ts_day", PrimitiveType::Date.into())
+                    .into(),
+                NestedField::optional(1001, "id_bucket", PrimitiveType::Int.into(),)
+                    .into(),
+                NestedField::optional(
+                    1002,
+                    "id_truncate",
+                    PrimitiveType::String.into(),
+                )
+                .into(),
+            ])
         );
+
+        // Dropping all sources must retain every partition field in its
+        // original position.
+        let empty_schema = Schema::builder().build().unwrap();
+        assert_eq!(
+            partition_spec.partition_type(&empty_schema).unwrap(),
+            StructType::new(vec![
+                NestedField::optional(1000, "ts_day", PrimitiveType::Date.into())
+                    .into(),
+                NestedField::optional(1001, "id_bucket", PrimitiveType::Int.into(),)
+                    .into(),
+                NestedField::optional(
+                    1002,
+                    "id_truncate",
+                    PrimitiveType::Unknown.into(),
+                )
+                .into(),
+            ])
+        );
+
+        // Missing sources must not suppress validation of transforms on
+        // remaining sources.
+        let incompatible_schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", PrimitiveType::Boolean.into()).into(),
+            ])
+            .build()
+            .unwrap();
+        let err = partition_spec
+            .partition_type(&incompatible_schema)
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            "boolean is not a valid input type of bucket transform"
+        );
+    }
+
+    #[test]
+    fn test_partition_type_without_source_type() {
+        let schema = Schema::builder().build().unwrap();
+        for (transform, expected_type) in [
+            (Transform::Identity, PrimitiveType::Unknown),
+            (Transform::Truncate(4), PrimitiveType::Unknown),
+            (Transform::Void, PrimitiveType::Unknown),
+            (Transform::Bucket(16), PrimitiveType::Int),
+            (Transform::Year, PrimitiveType::Int),
+            (Transform::Month, PrimitiveType::Int),
+            (Transform::Day, PrimitiveType::Date),
+            (Transform::Hour, PrimitiveType::Int),
+            (Transform::Unknown, PrimitiveType::String),
+        ] {
+            let spec = PartitionSpec {
+                spec_id: 0,
+                fields: vec![PartitionField {
+                    source_id: 1,
+                    field_id: 1000,
+                    name: "partition".to_string(),
+                    transform,
+                }],
+            };
+            assert_eq!(
+                spec.partition_type(&schema).unwrap(),
+                StructType::new(vec![
+                    NestedField::optional(1000, "partition", expected_type.into(),)
+                        .into(),
+                ])
+            );
+        }
     }
 
     #[test]
     fn test_builder_disallow_duplicate_names() {
         UnboundPartitionSpec::builder()
-            .add_partition_field(1, "ts_day".to_string(), Transform::Day)
+            .add_partition_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![1])
+                    .name("ts_day")
+                    .transform(Transform::Day)
+                    .build()
+                    .unwrap(),
+            )
             .unwrap()
-            .add_partition_field(2, "ts_day".to_string(), Transform::Day)
+            .add_partition_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![2])
+                    .name("ts_day")
+                    .transform(Transform::Day)
+                    .build()
+                    .unwrap(),
+            )
             .unwrap_err();
     }
 
@@ -1243,14 +1425,14 @@ mod tests {
             .unwrap();
         PartitionSpec::builder(schema.clone())
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: Some(1000),
                 name: "id".to_string(),
                 transform: Transform::Identity,
             })
             .unwrap()
             .add_unbound_field(UnboundPartitionField {
-                source_id: 2,
+                source_ids: vec![2],
                 field_id: Some(1000),
                 name: "id_bucket".to_string(),
                 transform: Transform::Bucket(16),
@@ -1286,14 +1468,14 @@ mod tests {
         let spec = PartitionSpec::builder(schema.clone())
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 name: "id".to_string(),
                 transform: Transform::Identity,
                 field_id: Some(1012),
             })
             .unwrap()
             .add_unbound_field(UnboundPartitionField {
-                source_id: 2,
+                source_ids: vec![2],
                 name: "name_void".to_string(),
                 transform: Transform::Void,
                 field_id: None,
@@ -1301,7 +1483,7 @@ mod tests {
             .unwrap()
             // Should keep its ID even if its lower
             .add_unbound_field(UnboundPartitionField {
-                source_id: 3,
+                source_ids: vec![3],
                 name: "year".to_string(),
                 transform: Transform::Year,
                 field_id: Some(1),
@@ -1394,7 +1576,7 @@ mod tests {
         let err = PartitionSpec::builder(schema)
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: None,
                 name: "id".to_string(),
                 transform: Transform::Bucket(16),
@@ -1431,7 +1613,7 @@ mod tests {
         PartitionSpec::builder(schema.clone())
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: None,
                 name: "id".to_string(),
                 transform: Transform::Identity,
@@ -1444,7 +1626,7 @@ mod tests {
         PartitionSpec::builder(schema)
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 2,
+                source_ids: vec![2],
                 field_id: None,
                 name: "id".to_string(),
                 transform: Transform::Identity,
@@ -1483,13 +1665,13 @@ mod tests {
             .with_spec_id(1)
             .add_unbound_fields(vec![
                 UnboundPartitionField {
-                    source_id: 1,
+                    source_ids: vec![1],
                     field_id: None,
                     name: "id_bucket".to_string(),
                     transform: Transform::Bucket(16),
                 },
                 UnboundPartitionField {
-                    source_id: 2,
+                    source_ids: vec![2],
                     field_id: None,
                     name: "name".to_string(),
                     transform: Transform::Identity,
@@ -1504,13 +1686,13 @@ mod tests {
             .with_spec_id(1)
             .add_unbound_fields(vec![
                 UnboundPartitionField {
-                    source_id: 1,
+                    source_ids: vec![1],
                     field_id: None,
                     name: "id_bucket".to_string(),
                     transform: Transform::Bucket(16),
                 },
                 UnboundPartitionField {
-                    source_id: 4,
+                    source_ids: vec![4],
                     field_id: None,
                     name: "name".to_string(),
                     transform: Transform::Identity,
@@ -1542,7 +1724,7 @@ mod tests {
         let err = PartitionSpec::builder(schema)
             .with_spec_id(1)
             .add_unbound_fields(vec![UnboundPartitionField {
-                source_id: 2,
+                source_ids: vec![2],
                 field_id: None,
                 name: "v_part".to_string(),
                 transform: Transform::Identity,
@@ -1560,15 +1742,21 @@ mod tests {
         let err = UnboundPartitionSpec::builder()
             .with_spec_id(1)
             .add_partition_field(
-                1,
-                "id_bucket[16]".to_string(),
-                Transform::Bucket(16),
+                UnboundPartitionField::builder()
+                    .source_ids(vec![1])
+                    .name("id_bucket[16]")
+                    .transform(Transform::Bucket(16))
+                    .build()
+                    .unwrap(),
             )
             .unwrap()
             .add_partition_field(
-                1,
-                "id_bucket_with_other_name".to_string(),
-                Transform::Bucket(16),
+                UnboundPartitionField::builder()
+                    .source_ids(vec![1])
+                    .name("id_bucket_with_other_name")
+                    .transform(Transform::Bucket(16))
+                    .build()
+                    .unwrap(),
             )
             .unwrap_err();
         assert!(err.message().contains("redundant partition"));
@@ -1591,7 +1779,7 @@ mod tests {
         PartitionSpec::builder(schema)
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: None,
                 name: "id_year".to_string(),
                 transform: Transform::Year,
@@ -1604,7 +1792,7 @@ mod tests {
         let spec = UnboundPartitionSpec::builder()
             .with_spec_id(1)
             .add_partition_fields(vec![UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: None,
                 name: "id_bucket[16]".to_string(),
                 transform: Transform::Bucket(16),
@@ -1617,7 +1805,7 @@ mod tests {
             UnboundPartitionSpec {
                 spec_id: Some(1),
                 fields: vec![UnboundPartitionField {
-                    source_id: 1,
+                    source_ids: vec![1],
                     field_id: None,
                     name: "id_bucket[16]".to_string(),
                     transform: Transform::Bucket(16),
@@ -1649,7 +1837,7 @@ mod tests {
         let partition_spec_1 = PartitionSpec::builder(schema.clone())
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: None,
                 name: "id_bucket".to_string(),
                 transform: Transform::Bucket(16),
@@ -1661,7 +1849,7 @@ mod tests {
         let partition_spec_2 = PartitionSpec::builder(schema)
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: None,
                 name: "id_bucket".to_string(),
                 transform: Transform::Bucket(16),
@@ -1690,7 +1878,7 @@ mod tests {
         let partition_spec_1 = PartitionSpec::builder(schema.clone())
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: None,
                 name: "id_bucket".to_string(),
                 transform: Transform::Bucket(16),
@@ -1702,7 +1890,7 @@ mod tests {
         let partition_spec_2 = PartitionSpec::builder(schema)
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: None,
                 name: "id_bucket".to_string(),
                 transform: Transform::Bucket(32),
@@ -1737,7 +1925,7 @@ mod tests {
         let partition_spec_1 = PartitionSpec::builder(schema.clone())
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: None,
                 name: "id_bucket".to_string(),
                 transform: Transform::Bucket(16),
@@ -1749,7 +1937,7 @@ mod tests {
         let partition_spec_2 = PartitionSpec::builder(schema)
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 2,
+                source_ids: vec![2],
                 field_id: None,
                 name: "id_bucket".to_string(),
                 transform: Transform::Bucket(16),
@@ -1784,14 +1972,14 @@ mod tests {
         let partition_spec_1 = PartitionSpec::builder(schema.clone())
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: None,
                 name: "id_bucket".to_string(),
                 transform: Transform::Bucket(16),
             })
             .unwrap()
             .add_unbound_field(UnboundPartitionField {
-                source_id: 2,
+                source_ids: vec![2],
                 field_id: None,
                 name: "name".to_string(),
                 transform: Transform::Identity,
@@ -1803,14 +1991,14 @@ mod tests {
         let partition_spec_2 = PartitionSpec::builder(schema)
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 2,
+                source_ids: vec![2],
                 field_id: None,
                 name: "name".to_string(),
                 transform: Transform::Identity,
             })
             .unwrap()
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: None,
                 name: "id_bucket".to_string(),
                 transform: Transform::Bucket(16),
@@ -1857,14 +2045,14 @@ mod tests {
         let spec = PartitionSpec::builder(schema)
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: Some(1001),
                 name: "id".to_string(),
                 transform: Transform::Identity,
             })
             .unwrap()
             .add_unbound_field(UnboundPartitionField {
-                source_id: 2,
+                source_ids: vec![2],
                 field_id: Some(1000),
                 name: "name".to_string(),
                 transform: Transform::Identity,
@@ -1899,14 +2087,14 @@ mod tests {
         let spec = PartitionSpec::builder(schema)
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: Some(1000),
                 name: "id".to_string(),
                 transform: Transform::Identity,
             })
             .unwrap()
             .add_unbound_field(UnboundPartitionField {
-                source_id: 2,
+                source_ids: vec![2],
                 field_id: Some(1001),
                 name: "name".to_string(),
                 transform: Transform::Identity,
@@ -1943,14 +2131,14 @@ mod tests {
         let spec = PartitionSpec::builder(schema)
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: Some(999),
                 name: "id".to_string(),
                 transform: Transform::Identity,
             })
             .unwrap()
             .add_unbound_field(UnboundPartitionField {
-                source_id: 2,
+                source_ids: vec![2],
                 field_id: Some(1000),
                 name: "name".to_string(),
                 transform: Transform::Identity,
@@ -1987,14 +2175,14 @@ mod tests {
         let spec = PartitionSpec::builder(schema)
             .with_spec_id(1)
             .add_unbound_field(UnboundPartitionField {
-                source_id: 1,
+                source_ids: vec![1],
                 field_id: Some(1000),
                 name: "id".to_string(),
                 transform: Transform::Identity,
             })
             .unwrap()
             .add_unbound_field(UnboundPartitionField {
-                source_id: 2,
+                source_ids: vec![2],
                 field_id: Some(1002),
                 name: "name".to_string(),
                 transform: Transform::Identity,
@@ -2058,6 +2246,37 @@ mod tests {
         assert_eq!(
             spec.partition_to_path(&data, schema.into()),
             "id=42/name=alice/ts_hour=1970-02-11-16/empty_void=null"
+        );
+    }
+
+    #[test]
+    fn test_partition_to_path_float_matches_java() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "d", Type::Primitive(PrimitiveType::Double))
+                    .into(),
+                NestedField::required(2, "f", Type::Primitive(PrimitiveType::Float))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let spec = PartitionSpec::builder(schema.clone())
+            .add_partition_field("d", "d", Transform::Identity)
+            .unwrap()
+            .add_partition_field("f", "f", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+
+        let data = Struct::from_iter([
+            Some(Literal::double(1.0)),
+            Some(Literal::float(1.0e7_f32)),
+        ]);
+
+        assert_eq!(
+            spec.partition_to_path(&data, schema.into()),
+            "d=1.0/f=1.0E7"
         );
     }
 
@@ -2135,5 +2354,161 @@ mod tests {
             spec.partition_to_path(&data, schema.into()),
             "data=a%2Fb%2Fc%2Fd/data_truc_10=a%2Fb%2Fc%2Fd"
         );
+    }
+    #[test]
+    fn test_unbound_partition_field_reads_source_ids_only() {
+        let field: UnboundPartitionField = serde_json::from_str(
+            r#"{"source-ids": [1, 2], "name": "m", "transform": "bucket[4]"}"#,
+        )
+        .unwrap();
+
+        assert_eq!([1, 2], field.source_ids());
+        // a multi-argument field has no single source id
+        assert!(
+            field
+                .source_id()
+                .unwrap_err()
+                .to_string()
+                .contains("has no single source id")
+        );
+
+        let serialized = serde_json::to_value(&field).unwrap();
+        assert_eq!(
+            Some(&serde_json::json!([1, 2])),
+            serialized.get("source-ids")
+        );
+        assert!(serialized.get("source-id").is_none());
+    }
+    #[test]
+    fn test_unbound_partition_field_single_source_id_round_trip() {
+        let field: UnboundPartitionField = serde_json::from_str(
+            r#"{"source-id": 1, "name": "m", "transform": "identity"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(1, field.source_id().unwrap());
+        assert_eq!([1], field.source_ids());
+
+        // a single-argument field keeps writing source-id
+        let serialized = serde_json::to_value(&field).unwrap();
+        assert_eq!(Some(&serde_json::json!(1)), serialized.get("source-id"));
+        assert!(serialized.get("source-ids").is_none());
+    }
+
+    #[test]
+    fn test_unbound_partition_field_rejects_malformed_source_ids() {
+        for (input, expected) in [
+            (
+                r#"{"source-ids": [], "name": "m", "transform": "identity"}"#,
+                "Empty source-ids is not allowed",
+            ),
+            (
+                r#"{"name": "m", "transform": "identity"}"#,
+                "Either `source-id` or `source-ids` must be present",
+            ),
+            (
+                r#"{"source-id": 1, "source-ids": [1], "name": "m", "transform": "identity"}"#,
+                "mutually exclusive",
+            ),
+        ] {
+            let err =
+                serde_json::from_str::<UnboundPartitionField>(input).unwrap_err();
+            assert!(
+                err.to_string().contains(expected),
+                "unexpected error for {input}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_binding_a_multi_argument_field_fails_loudly() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "a", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+                NestedField::required(2, "b", Type::Primitive(PrimitiveType::Int))
+                    .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let spec: UnboundPartitionSpec = serde_json::from_str(
+            r#"{"spec-id": 1, "fields": [{"source-ids": [1, 2], "field-id": 1000, "name": "m", "transform": "bucket[4]"}]}"#,
+        )
+        .unwrap();
+
+        // A bound PartitionField still carries a single source id, so binding has to refuse
+        // rather than quietly keep the first one.
+        let err = spec.bind(schema).unwrap_err();
+        assert!(
+            err.to_string().contains("has no single source id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_unbound_partition_field_builder_rejects_empty_source_ids() {
+        let err = UnboundPartitionField::builder()
+            .source_ids(vec![])
+            .name("m")
+            .transform(Transform::Identity)
+            .build()
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("Empty source-ids is not allowed"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_partition_to_path_with_dropped_source_column() {
+        for (source_type, transform, value, expected) in [
+            (
+                PrimitiveType::Int,
+                Transform::Identity,
+                Literal::int(1),
+                "p=1",
+            ),
+            (
+                PrimitiveType::Timestamp,
+                Transform::Identity,
+                Literal::long(1),
+                "p=1",
+            ),
+            (
+                PrimitiveType::Int,
+                Transform::Truncate(10),
+                Literal::int(10),
+                "p=10",
+            ),
+        ] {
+            let schema = Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "kept", PrimitiveType::Int.into())
+                        .into(),
+                    NestedField::required(2, "dropped", source_type.into()).into(),
+                ])
+                .build()
+                .unwrap();
+            let spec = PartitionSpec::builder(schema)
+                .add_partition_field("dropped", "p", transform)
+                .unwrap()
+                .build()
+                .unwrap();
+            let current_schema = Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "kept", PrimitiveType::Int.into())
+                        .into(),
+                ])
+                .build()
+                .unwrap();
+            assert_eq!(
+                spec.partition_to_path(
+                    &Struct::from_iter([Some(value)]),
+                    current_schema.into()
+                ),
+                expected
+            );
+        }
     }
 }

@@ -146,7 +146,18 @@ impl BasicDeleteFileLoader {
             }
             None => input.reader()?.read_range(offset..end)?,
         };
-        DeleteVector::from_puffin_v1_bytes(&bytes, task.record_count)
+        let delete_vector = DeleteVector::deserialize(&bytes)?;
+        let actual = delete_vector.len();
+        if actual != task.record_count {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "deletion vector {} decoded to {actual} positions, expected {} from record_count",
+                    task.file_path, task.record_count
+                ),
+            ));
+        }
+        Ok(delete_vector)
     }
 
     /// Evolves the schema of the RecordBatches from an equality delete file.
@@ -223,5 +234,51 @@ mod tests {
         let result = result.collect::<Result<Vec<_>>>().unwrap();
 
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_read_deletion_vector_validates_cardinality() {
+        use crate::spec::Struct;
+        use crate::writer::base_writer::deletion_vector_writer::{
+            DeletionVectorFileWriter, ReferencedDataFile,
+        };
+
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("dv.puffin");
+        let path = path.to_str().unwrap();
+        let file_io = FileIO::local();
+        let mut writer = DeletionVectorFileWriter::new(file_io.clone(), path);
+        writer
+            .delete_all(
+                ReferencedDataFile::new("data.parquet", Struct::empty(), 0),
+                [1, 3, 5],
+            )
+            .unwrap();
+        let file = writer.close().unwrap().into_delete_files().pop().unwrap();
+        let mut task = FileScanTaskDeleteFile::builder()
+            .with_file_path(file.file_path().to_owned())
+            .with_file_size_in_bytes(file.file_size_in_bytes())
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_file_format(DataFileFormat::Puffin)
+            .with_partition_spec_id(0)
+            .with_referenced_data_file(Some("data.parquet".to_owned()))
+            .with_content_offset(file.content_offset())
+            .with_content_size_in_bytes(file.content_size_in_bytes())
+            .with_record_count(file.record_count())
+            .build()
+            .unwrap();
+        let loader = BasicDeleteFileLoader::new(file_io);
+        let decoded = loader.read_deletion_vector(&task).unwrap();
+        assert_eq!(decoded.iter().collect::<Vec<_>>(), vec![1, 3, 5]);
+
+        task.record_count = 4;
+        let err = loader.read_deletion_vector(&task).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            format!(
+                "deletion vector {path} decoded to 3 positions, expected 4 from record_count"
+            )
+        );
     }
 }

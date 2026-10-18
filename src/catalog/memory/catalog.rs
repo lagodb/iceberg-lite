@@ -24,13 +24,15 @@ use itertools::Itertools;
 
 use super::namespace_state::NamespaceState;
 use crate::encryption::kms::{KeyManagementClient, KmsClientFactory};
+use crate::error::invalid_data;
 use crate::io::FileIO;
 use crate::spec::{TableMetadata, TableMetadataBuilder};
 use crate::table::Table;
 use crate::{
-    Catalog, CatalogBuilder, Error, ErrorKind, MetadataLocation, Namespace,
-    NamespaceIdent, Result, TableCommit, TableCreation, TableIdent,
+    Catalog, CatalogBuilder, MetadataLocation, Namespace, NamespaceIdent, Result,
+    TableCommit, TableCreation, TableIdent,
 };
+use crate::{Error, ErrorKind};
 
 /// Memory catalog warehouse location
 pub const MEMORY_CATALOG_WAREHOUSE: &str = "warehouse";
@@ -95,10 +97,7 @@ impl CatalogBuilder for MemoryCatalogBuilder {
                 "Catalog name is required",
             ))
         } else if self.config.warehouse.is_empty() {
-            Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Catalog warehouse is required",
-            ))
+            Err(invalid_data!("Catalog warehouse is required"))
         } else {
             let kms_client = match self.kms_client_factory {
                 Some(factory) => Some(factory.create_kms_client(&self.config.props)?),
@@ -437,6 +436,7 @@ pub(crate) mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::ErrorKind;
     use crate::encryption::kms::MemoryKmsClientFactory;
     use crate::io::FileIO;
     use crate::spec::{

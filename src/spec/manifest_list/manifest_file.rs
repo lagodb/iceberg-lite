@@ -190,7 +190,8 @@ impl ManifestFile {
             None => input.read()?,
         };
 
-        let (metadata, mut entries) = Manifest::try_from_avro_bytes(&avro)?;
+        let (metadata, mut entries) =
+            Manifest::try_from_avro_bytes(&avro, Some(&self.manifest_path))?;
 
         // Let entries inherit values from the manifest list entry.
         for entry in &mut entries {

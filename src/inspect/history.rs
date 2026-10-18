@@ -133,10 +133,10 @@ mod tests {
     use crate::Result;
     use crate::TableIdent;
     use crate::io::FileIO;
-    use crate::scan::tests::TableTestFixture;
     use crate::spec::TableMetadata;
     use crate::table::Table;
     use crate::test_utils::check_record_batches;
+    use crate::test_utils::scan::TableTestFixture;
     use expect_test::expect;
 
     fn table_from_metadata_json(metadata_json: &str) -> Table {
@@ -152,7 +152,8 @@ mod tests {
 
     #[test]
     fn test_history_table() {
-        let table = TableTestFixture::new().table;
+        let fixture = TableTestFixture::new();
+        let table = &fixture.table;
 
         let batches = table
             .inspect()

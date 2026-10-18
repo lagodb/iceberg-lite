@@ -28,7 +28,7 @@ use http::{Method, Request, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use url::Url;
 
-use super::auth::{AuthSession, NoopSession};
+use super::auth::AuthSession;
 use super::catalog::RestCatalogConfig;
 use super::request::{HttpRequest, HttpRequestBuilder};
 use super::types::{ErrorResponse, RestError, RestErrorKind};
@@ -47,14 +47,13 @@ pub trait HttpTransport: Debug + Send + Sync {
     ) -> Result<Response<Bytes>>;
 }
 
-/// REST client sharing one transport and authentication session.
+/// REST client sharing one transport and configured headers.
 #[derive(Clone)]
 pub struct HttpClient {
     transport: Arc<dyn HttpTransport>,
     extra_headers: HeaderMap,
     redirect_restricted_headers: HashSet<HeaderName>,
     disable_header_redaction: bool,
-    auth_session: Arc<dyn AuthSession>,
 }
 
 impl Debug for HttpClient {
@@ -83,21 +82,7 @@ impl HttpClient {
                 .cloned()
                 .collect(),
             disable_header_redaction: config.disable_header_redaction(),
-            auth_session: Arc::new(NoopSession),
         })
-    }
-
-    /// Returns a client using the supplied authentication session.
-    pub fn with_auth_session(&self, auth_session: Arc<dyn AuthSession>) -> Self {
-        Self {
-            auth_session,
-            ..self.clone()
-        }
-    }
-
-    /// Returns a client that sends no authentication.
-    pub fn without_auth_session(&self) -> Self {
-        self.with_auth_session(Arc::new(NoopSession))
     }
 
     pub(crate) fn update_with(self, config: &RestCatalogConfig) -> Result<Self> {
@@ -117,7 +102,6 @@ impl HttpClient {
                 configured_restricted_headers
             },
             disable_header_redaction: config.disable_header_redaction(),
-            auth_session: self.auth_session,
         })
     }
 
@@ -133,14 +117,18 @@ impl HttpClient {
 
     pub(crate) fn query_catalog(
         &self,
+        auth_session: &dyn AuthSession,
         mut request: HttpRequest,
     ) -> Result<Response<Bytes>> {
-        self.auth_session.authenticate(&mut request)?;
+        auth_session.authenticate(&mut request)?;
         request.headers_mut().extend(self.extra_headers.clone());
-        self.execute_redirects(request, Some(&self.extra_headers))
+        self.execute_redirects(request, Some(auth_session), Some(&self.extra_headers))
     }
 
-    /// Sends a form POST for an authentication exchange.
+    /// Sends an unauthenticated form POST for an authentication exchange.
+    ///
+    /// Only the supplied headers and form are sent; catalog headers and session
+    /// authentication are not applied to a request that derives a session.
     pub fn post_form(
         &self,
         url: &str,
@@ -151,12 +139,11 @@ impl HttpClient {
             Error::new(ErrorKind::DataInvalid, "invalid OAuth token endpoint URL")
                 .with_source(error)
         })?;
-        let mut request = HttpRequestBuilder::new(Method::POST, url)
+        let request = HttpRequestBuilder::new(Method::POST, url)
             .headers(headers.clone())
             .form(form)
             .build()?;
-        self.auth_session.authenticate(&mut request)?;
-        let response = self.execute_redirects(request, None)?;
+        let response = self.execute_redirects(request, None, None)?;
         Ok((response.status(), response.into_body()))
     }
 
@@ -167,6 +154,7 @@ impl HttpClient {
     fn execute_redirects(
         &self,
         mut request: HttpRequest,
+        auth_session: Option<&dyn AuthSession>,
         catalog_headers: Option<&HeaderMap>,
     ) -> Result<Response<Bytes>> {
         let deadline = Instant::now().checked_add(DEFAULT_REQUEST_TIMEOUT);
@@ -223,7 +211,9 @@ impl HttpClient {
             if authentication_allowed {
                 // Authentication may cover the method, path or body, so a
                 // same-origin redirect must be authenticated as a new request.
-                self.auth_session.authenticate(&mut request)?;
+                if let Some(session) = auth_session {
+                    session.authenticate(&mut request)?;
+                }
                 if let Some(headers) = catalog_headers {
                     request.headers_mut().extend(headers.clone());
                 }

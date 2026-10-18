@@ -23,7 +23,7 @@ include = [
 [dependencies]
 thiserror = "1.0"
 anyhow = "1.0.72"
-apache-avro = { version = "0.21", features = ["snappy", "zstandard"] }
+apache-avro = { version = "0.22", features = ["snappy", "zstandard"] }
 aes-gcm = "0.10"
 array-init = "2"
 arrow-arith = "59.2.0"
@@ -31,7 +31,7 @@ arrow-array = "59.2.0"
 arrow-buffer = "59.2.0"
 arrow-cast = "59.2.0"
 arrow-ord = "59.2.0"
-arrow-schema = "59.2.0"
+arrow-schema = { version = "59.2.0", features = ["canonical_extension_types"] }
 arrow-select = "59.2.0"
 arrow-string = "59.2.0"
 as-any = "0.3.2"
@@ -74,7 +74,10 @@ murmur3 = "0.5.2"
 once_cell = "1.20"
 ordered-float = "4"
 parking_lot = "0.12"
-parquet = { version = "59.2.0", features = ["encryption"] }
+parquet = { version = "59.2.0", features = [
+  "encryption",
+  "arrow_canonical_extension_types",
+] }
 pilota = "0.11.10"
 port_scanner = "0.1.5"
 pretty_assertions = "1.4"

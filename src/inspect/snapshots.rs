@@ -166,12 +166,13 @@ mod tests {
     use expect_test::expect;
 
     use crate::Result;
-    use crate::scan::tests::TableTestFixture;
     use crate::test_utils::check_record_batches;
+    use crate::test_utils::scan::TableTestFixture;
 
     #[test]
     fn test_snapshots_table() {
-        let table = TableTestFixture::new().table;
+        let fixture = TableTestFixture::new();
+        let table = &fixture.table;
 
         let batch_iterator = table.inspect().snapshots().scan().unwrap();
 

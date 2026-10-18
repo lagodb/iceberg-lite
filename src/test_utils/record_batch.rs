@@ -15,9 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Test utilities.
-//! This module is pub just for internal testing.
-//! It is subject to change and is not intended to be used by external users.
+//! Snapshot assertions over [`RecordBatch`] results.
 
 use arrow_array::RecordBatch;
 use expect_test::Expect;
@@ -31,7 +29,7 @@ use itertools::Itertools;
 ///   Check the doc of [`expect_test`] for more details.
 /// - `ignore_check_columns`: Some columns are not stable, so we can skip them.
 /// - `sort_column`: The order of the data might be non-deterministic, so we can sort it by a column.
-pub fn check_record_batches(
+pub(crate) fn check_record_batches(
     record_batches: Vec<RecordBatch>,
     expected_schema: Expect,
     expected_data: Expect,

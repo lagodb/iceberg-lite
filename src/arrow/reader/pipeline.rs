@@ -424,74 +424,6 @@ impl ArrowReader {
 
         let use_position_fallback = missing_field_ids && plan.name_mapping.is_none();
 
-        // Three-branch schema resolution strategy matching Java's ReadConf constructor
-        //
-        // Per Iceberg spec Column Projection rules:
-        // "Columns in Iceberg data files are selected by field id. The table schema's column
-        //  names and order may change after a data file is written, and projection must be done
-        //  using field ids."
-        // https://iceberg.apache.org/spec/#column-projection
-        //
-        // When Parquet files lack field IDs (e.g., Hive/Spark migrations via add_files),
-        // we must assign field IDs BEFORE reading data to enable correct projection.
-        //
-        // Java's ReadConf determines field ID strategy:
-        // - Branch 1: hasIds(fileSchema) → trust embedded field IDs, use pruneColumns()
-        // - Branch 2: nameMapping present → applyNameMapping(), then pruneColumns()
-        // - Branch 3: fallback → addFallbackIds(), then pruneColumnsFallback()
-        let arrow_metadata = if missing_field_ids {
-            // Parquet file lacks field IDs - must assign them before reading
-            let arrow_schema = if let Some(name_mapping) = plan.name_mapping {
-                // Branch 2: Apply name mapping to assign correct Iceberg field IDs
-                // Per spec rule #2: "Use schema.name-mapping.default metadata to map field id
-                // to columns without field id"
-                // Corresponds to Java's ParquetSchemaUtil.applyNameMapping()
-                apply_name_mapping_to_arrow_schema(
-                    Arc::clone(arrow_metadata.schema()),
-                    name_mapping,
-                )?
-            } else {
-                // Branch 3: No name mapping - use position-based fallback IDs
-                // Corresponds to Java's ParquetSchemaUtil.addFallbackIds()
-                add_fallback_field_ids_to_arrow_schema(arrow_metadata.schema())
-            };
-
-            let options = ArrowReaderOptions::new().with_schema(arrow_schema);
-            ArrowReaderMetadata::try_new(
-                Arc::clone(arrow_metadata.metadata()),
-                options,
-            )
-            .map_err(|err| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Failed to create ArrowReaderMetadata with field ID schema",
-                )
-                .with_source(err)
-            })?
-        } else {
-            // Branch 1: File has embedded field IDs - trust them
-            arrow_metadata
-        };
-
-        let arrow_metadata = if let Some(coerced_schema) =
-            coerce_int96_timestamps(arrow_metadata.schema(), plan.schema)
-        {
-            let options = ArrowReaderOptions::new().with_schema(coerced_schema);
-            ArrowReaderMetadata::try_new(
-                Arc::clone(arrow_metadata.metadata()),
-                options,
-            )
-            .map_err(|err| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Failed to create ArrowReaderMetadata with INT96-coerced schema",
-                )
-                .with_source(err)
-            })?
-        } else {
-            arrow_metadata
-        };
-
         // In addition to the optional predicate supplied in the `FileScanTask`,
         // we also have an optional predicate resulting from equality delete files.
         // If both are present, we logical-AND them together to form a single filter.
@@ -556,11 +488,12 @@ impl ArrowReader {
         };
         let first_row_id = plan.first_row_id;
 
-        let arrow_metadata = if needs_row_number_column {
-            Self::with_row_number_column(arrow_metadata)?
-        } else {
-            arrow_metadata
-        };
+        let arrow_metadata = Self::configure_arrow_reader_metadata(
+            arrow_metadata,
+            &plan,
+            missing_field_ids,
+            needs_row_number_column,
+        )?;
 
         let mut record_batch_reader_builder =
             ParquetRecordBatchReaderBuilder::new_with_metadata(
@@ -794,27 +727,14 @@ impl ArrowReader {
                 record_batch_reader_builder.with_row_filter(row_filter);
 
             if row_group_filtering_enabled {
-                let predicate_filtered_row_groups =
-                    Self::get_selected_row_group_indices(
+                selected_row_group_indices =
+                    Some(Self::get_selected_row_group_indices(
                         predicate,
                         record_batch_reader_builder.metadata(),
                         &field_id_map,
                         plan.schema,
-                    )?;
-
-                // Merge predicate-based filtering with byte range filtering (if present)
-                // by taking the intersection of both filters
-                selected_row_group_indices = match selected_row_group_indices {
-                    Some(byte_range_filtered) => {
-                        // Keep only row groups that are in both filters
-                        let intersection: Vec<usize> = byte_range_filtered
-                            .into_iter()
-                            .filter(|idx| predicate_filtered_row_groups.contains(idx))
-                            .collect();
-                        Some(intersection)
-                    }
-                    None => Some(predicate_filtered_row_groups),
-                };
+                        selected_row_group_indices.as_deref(),
+                    )?);
             }
 
             if bloom_filter_enabled {
@@ -991,28 +911,60 @@ impl ArrowReader {
         Ok(result)
     }
 
-    fn with_row_number_column(
+    fn configure_arrow_reader_metadata(
         arrow_metadata: ArrowReaderMetadata,
+        plan: &FileReadPlan<'_>,
+        missing_field_ids: bool,
+        install_row_number: bool,
     ) -> Result<ArrowReaderMetadata> {
-        let options = ArrowReaderOptions::new()
-            .with_schema(Arc::clone(arrow_metadata.schema()))
-            .with_virtual_columns(vec![Self::row_number_field()])
-            .map_err(|err| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Failed to configure Parquet row-number metadata column",
-                )
-                .with_source(err)
-            })?;
+        // Schema resolution follows the Iceberg Column Projection rule:
+        // "Columns in Iceberg data files are selected by field id."
+        // https://iceberg.apache.org/spec/#column-projection
+        //
+        // This mirrors Java's ReadConf strategy: use embedded IDs with pruneColumns();
+        // otherwise, use applyNameMapping() followed by pruneColumns() when configured, or
+        // addFallbackIds() followed by pruneColumnsFallback() for position-based fallback.
+        // The fast path returns early without materializing an owned schema.
+        let arrow_schema = if missing_field_ids {
+            let schema = if let Some(name_mapping) = plan.name_mapping {
+                apply_name_mapping_to_arrow_schema(
+                    Arc::clone(arrow_metadata.schema()),
+                    name_mapping,
+                )?
+            } else {
+                add_fallback_field_ids_to_arrow_schema(arrow_metadata.schema())
+            };
+            // Coerce INT96 timestamp columns before building the stream reader to avoid
+            // i64 overflow in arrow-rs. Apply this after assigning any missing field IDs
+            // so the final schema contains both changes.
+            coerce_int96_timestamps(&schema, plan.schema).unwrap_or(schema)
+        } else if let Some(coerced) =
+            coerce_int96_timestamps(arrow_metadata.schema(), plan.schema)
+        {
+            coerced
+        } else if install_row_number {
+            Arc::clone(arrow_metadata.schema())
+        } else {
+            return Ok(arrow_metadata);
+        };
 
-        ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options)
-            .map_err(|err| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    "Failed to create ArrowReaderMetadata with row-number column",
-                )
-                .with_source(err)
-            })
+        let mut options =
+            ArrowReaderOptions::new().with_schema(Arc::clone(&arrow_schema));
+        if install_row_number {
+            options = options.with_virtual_columns(vec![Self::row_number_field()])?;
+        }
+
+        ArrowReaderMetadata::try_new(Arc::clone(arrow_metadata.metadata()), options).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "Failed to create ArrowReaderMetadata with the configured reader options \
+                     (missing_field_ids: {missing_field_ids}, \
+                      install_row_number: {install_row_number}, schema: {arrow_schema})"
+                ),
+            )
+            .with_source(e)
+        })
     }
 
     fn row_number_field() -> FieldRef {

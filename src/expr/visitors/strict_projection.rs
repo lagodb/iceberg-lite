@@ -2823,7 +2823,7 @@ mod tests {
         let result = strict_projection.strict_project(&predicate).unwrap();
         assert_eq!(
             result.to_string(),
-            "((pcol1 < 100) AND (pcol2 < 100)) AND (pcol3 < 10000)".to_string()
+            "((pcol1 < 100) AND (pcol2 < 100)) AND (pcol3 < 100.00)".to_string()
         );
 
         // test less or eq
@@ -2842,7 +2842,7 @@ mod tests {
         let result = strict_projection.strict_project(&predicate).unwrap();
         assert_eq!(
             result.to_string(),
-            "((pcol1 < 100) AND (pcol2 < 100)) AND (pcol3 < 10000)".to_string()
+            "((pcol1 < 100) AND (pcol2 < 100)) AND (pcol3 < 100.00)".to_string()
         );
 
         // test greater
@@ -2861,7 +2861,7 @@ mod tests {
         let result = strict_projection.strict_project(&predicate).unwrap();
         assert_eq!(
             result.to_string(),
-            "((pcol1 > 100) AND (pcol2 > 100)) AND (pcol3 > 10000)".to_string()
+            "((pcol1 > 100) AND (pcol2 > 100)) AND (pcol3 > 100.00)".to_string()
         );
 
         // test greater or eq
@@ -2880,7 +2880,7 @@ mod tests {
         let result = strict_projection.strict_project(&predicate).unwrap();
         assert_eq!(
             result.to_string(),
-            "((pcol1 > 90) AND (pcol2 > 90)) AND (pcol3 > 9990)".to_string()
+            "((pcol1 > 90) AND (pcol2 > 90)) AND (pcol3 > 99.90)".to_string()
         );
 
         // test not eq
@@ -2899,7 +2899,7 @@ mod tests {
         let result = strict_projection.strict_project(&predicate).unwrap();
         assert_eq!(
             result.to_string(),
-            "((pcol1 != 100) AND (pcol2 != 100)) AND (pcol3 != 10000)".to_string()
+            "((pcol1 != 100) AND (pcol2 != 100)) AND (pcol3 != 100.00)".to_string()
         );
 
         // test not in
@@ -2938,7 +2938,7 @@ mod tests {
         let result = strict_projection.strict_project(&predicate).unwrap();
         assert_eq!(
             result.to_string(),
-            "((pcol1 NOT IN (100, 90)) AND (pcol2 NOT IN (100, 90))) AND (pcol3 NOT IN (10000, 10100, 9900))"
+            "((pcol1 NOT IN (100, 90)) AND (pcol2 NOT IN (100, 90))) AND (pcol3 NOT IN (100.00, 99.00, 101.00))"
                 .to_string()
         );
 
@@ -3038,7 +3038,7 @@ mod tests {
         let result = strict_projection.strict_project(&predicate).unwrap();
         assert_eq!(
             result.to_string(),
-            "((pcol1 < 90) AND (pcol2 < 90)) AND (pcol3 < 9990)".to_string()
+            "((pcol1 < 90) AND (pcol2 < 90)) AND (pcol3 < 99.90)".to_string()
         );
 
         // test less or eq
@@ -3057,7 +3057,7 @@ mod tests {
         let result = strict_projection.strict_project(&predicate).unwrap();
         assert_eq!(
             result.to_string(),
-            "((pcol1 < 100) AND (pcol2 < 100)) AND (pcol3 < 10000)".to_string()
+            "((pcol1 < 100) AND (pcol2 < 100)) AND (pcol3 < 100.00)".to_string()
         );
 
         // test greater
@@ -3076,7 +3076,7 @@ mod tests {
         let result = strict_projection.strict_project(&predicate).unwrap();
         assert_eq!(
             result.to_string(),
-            "((pcol1 > 90) AND (pcol2 > 90)) AND (pcol3 > 9990)".to_string()
+            "((pcol1 > 90) AND (pcol2 > 90)) AND (pcol3 > 99.90)".to_string()
         );
 
         // test greater or eq
@@ -3095,7 +3095,7 @@ mod tests {
         let result = strict_projection.strict_project(&predicate).unwrap();
         assert_eq!(
             result.to_string(),
-            "((pcol1 > 90) AND (pcol2 > 90)) AND (pcol3 > 9990)".to_string()
+            "((pcol1 > 90) AND (pcol2 > 90)) AND (pcol3 > 99.90)".to_string()
         );
 
         // test not eq
@@ -3114,7 +3114,7 @@ mod tests {
         let result = strict_projection.strict_project(&predicate).unwrap();
         assert_eq!(
             result.to_string(),
-            "((pcol1 != 90) AND (pcol2 != 90)) AND (pcol3 != 9990)".to_string()
+            "((pcol1 != 90) AND (pcol2 != 90)) AND (pcol3 != 99.90)".to_string()
         );
 
         // test not in
@@ -3153,7 +3153,7 @@ mod tests {
         let result = strict_projection.strict_project(&predicate).unwrap();
         assert_eq!(
             result.to_string(),
-            "((pcol1 NOT IN (100, 90)) AND (pcol2 NOT IN (100, 90))) AND (pcol3 NOT IN (9890, 9990, 10090))"
+            "((pcol1 NOT IN (100, 90)) AND (pcol2 NOT IN (100, 90))) AND (pcol3 NOT IN (98.90, 100.90, 99.90))"
                 .to_string()
         );
 

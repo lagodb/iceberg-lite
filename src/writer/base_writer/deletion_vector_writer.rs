@@ -397,10 +397,6 @@ impl DeletionVectorFileWriter {
         let output_key_metadata = encryption_manager
             .as_ref()
             .map(|manager| manager.generate_key_metadata());
-        let encoded_output_key_metadata = output_key_metadata
-            .as_ref()
-            .map(StandardKeyMetadata::encode)
-            .transpose()?;
         let mut writer = match output_key_metadata.as_ref() {
             Some(key_metadata) => {
                 let encrypted_output =
@@ -427,10 +423,11 @@ impl DeletionVectorFileWriter {
             pending_outputs.push((pending.target, cardinality, blob_metadata));
         }
 
-        writer.close()?;
-
-        let file_size_in_bytes =
-            file_io.new_input(&output_file_path)?.metadata()?.size;
+        let saved_metadata = writer.close()?;
+        let file_size_in_bytes = saved_metadata.size;
+        let encoded_output_key_metadata = output_key_metadata
+            .map(|metadata| metadata.with_file_length(file_size_in_bytes).encode())
+            .transpose()?;
 
         let mut delete_files = Vec::with_capacity(pending_outputs.len());
         let mut referenced_data_files = Vec::with_capacity(pending_outputs.len());
@@ -510,7 +507,18 @@ impl DeletionVectorFileWriter {
             }
             None => input.reader()?.read_range(offset..end)?,
         };
-        DeleteVector::from_puffin_v1_bytes(&bytes, delete_file.record_count)
+        let delete_vector = DeleteVector::deserialize(&bytes)?;
+        let actual = delete_vector.len();
+        if actual != delete_file.record_count {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!(
+                    "deletion vector {} decoded to {actual} positions, expected {} from record_count",
+                    delete_file.file_path, delete_file.record_count
+                ),
+            ));
+        }
+        Ok(delete_vector)
     }
 
     fn merge_existing_parquet_position_delete(
@@ -765,5 +773,22 @@ mod tests {
         )
         .expect("read merged deletion vector");
         assert_eq!(delete_vector.iter().collect::<Vec<_>>(), vec![1, 2, 3]);
+
+        let mismatched = ExistingPositionDeleteFile {
+            record_count: 4,
+            ..new_delete_file
+        };
+        let err = DeletionVectorFileWriter::read_existing_deletion_vector(
+            &mismatched,
+            &file_io,
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert_eq!(
+            err.message(),
+            format!(
+                "deletion vector {new_path} decoded to 3 positions, expected 4 from record_count"
+            )
+        );
     }
 }

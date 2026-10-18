@@ -6,7 +6,7 @@ use bytes::Bytes;
 use http::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap};
 use http::{Method, Response, StatusCode};
 
-use super::super::auth::AuthSession;
+use super::super::auth::{AuthSession, NoopSession};
 use super::super::catalog::RestCatalogConfig;
 use super::super::client::{
     HttpClient, deserialize_unexpected_catalog_error,
@@ -31,10 +31,13 @@ fn not_modified_is_a_catalog_response_not_a_redirect() {
     );
     let client = HttpClient::new(&config).unwrap();
     let response = client
-        .query_catalog(HttpRequest::new(
-            Method::GET,
-            "https://catalog.test/v1/table".parse().unwrap(),
-        ))
+        .query_catalog(
+            &NoopSession,
+            HttpRequest::new(
+                Method::GET,
+                "https://catalog.test/v1/table".parse().unwrap(),
+            ),
+        )
         .unwrap();
     assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
     transport.assert_finished();
@@ -66,10 +69,13 @@ fn cross_origin_redirect_removes_configured_authorization() {
     );
     let client = HttpClient::new(&config).unwrap();
     client
-        .query_catalog(HttpRequest::new(
-            Method::GET,
-            "https://catalog.test/v1/config".parse().unwrap(),
-        ))
+        .query_catalog(
+            &NoopSession,
+            HttpRequest::new(
+                Method::GET,
+                "https://catalog.test/v1/config".parse().unwrap(),
+            ),
+        )
         .unwrap();
     transport.assert_finished();
 }
@@ -97,10 +103,13 @@ fn cross_origin_redirect_removes_all_catalog_scoped_headers() {
     );
     let client = HttpClient::new(&config).unwrap();
     client
-        .query_catalog(HttpRequest::new(
-            Method::GET,
-            "https://catalog.test/v1/config".parse().unwrap(),
-        ))
+        .query_catalog(
+            &NoopSession,
+            HttpRequest::new(
+                Method::GET,
+                "https://catalog.test/v1/config".parse().unwrap(),
+            ),
+        )
         .unwrap();
     transport.assert_finished();
 }
@@ -130,7 +139,7 @@ fn see_other_rewrites_post_to_get_and_removes_entity_headers() {
     .build()
     .unwrap();
 
-    let response = client.query_catalog(request).unwrap();
+    let response = client.query_catalog(&NoopSession, request).unwrap();
 
     assert_eq!(response.body(), &Bytes::from_static(b"done"));
     transport.assert_finished();
@@ -160,7 +169,7 @@ fn temporary_redirect_preserves_post_and_body() {
     .build()
     .unwrap();
 
-    client.query_catalog(request).unwrap();
+    client.query_catalog(&NoopSession, request).unwrap();
     transport.assert_finished();
 }
 
@@ -176,10 +185,13 @@ fn redirect_without_location_is_rejected() {
     let client = HttpClient::new(&config).unwrap();
 
     let error = client
-        .query_catalog(HttpRequest::new(
-            Method::GET,
-            format!("{CATALOG_URI}/v1/start").parse().unwrap(),
-        ))
+        .query_catalog(
+            &NoopSession,
+            HttpRequest::new(
+                Method::GET,
+                format!("{CATALOG_URI}/v1/start").parse().unwrap(),
+            ),
+        )
         .unwrap_err();
 
     assert!(error.to_string().contains("Location"));
@@ -202,10 +214,13 @@ fn redirect_limit_is_enforced() {
     let client = HttpClient::new(&config).unwrap();
 
     let error = client
-        .query_catalog(HttpRequest::new(
-            Method::GET,
-            format!("{CATALOG_URI}/v1/0").parse().unwrap(),
-        ))
+        .query_catalog(
+            &NoopSession,
+            HttpRequest::new(
+                Method::GET,
+                format!("{CATALOG_URI}/v1/0").parse().unwrap(),
+            ),
+        )
         .unwrap_err();
 
     assert!(error.to_string().contains("redirect limit"));
@@ -213,10 +228,12 @@ fn redirect_limit_is_enforced() {
 }
 
 #[derive(Debug)]
-struct StaticSession;
+struct PathSession;
 
-impl AuthSession for StaticSession {
+impl AuthSession for PathSession {
     fn authenticate(&self, request: &mut HttpRequest) -> Result<()> {
+        let path = request.url().path().parse().unwrap();
+        request.headers_mut().insert("x-signed-path", path);
         request
             .headers_mut()
             .insert(AUTHORIZATION, "Bearer token".parse().unwrap());
@@ -225,33 +242,50 @@ impl AuthSession for StaticSession {
 }
 
 #[test]
-fn post_form_uses_the_session_until_the_caller_removes_it() {
+fn supplied_session_authenticates_same_origin_redirects() {
     let transport = Arc::new(MockHttpTransport::default());
     transport.expect(
-        ExpectedExchange::post("https://auth.test/token")
+        ExpectedExchange::get(format!("{CATALOG_URI}/v1/start"))
             .header(AUTHORIZATION, "Bearer token")
+            .header("x-signed-path", "/v1/start")
+            .redirect(StatusCode::TEMPORARY_REDIRECT, "/v1/final"),
+    );
+    transport.expect(
+        ExpectedExchange::get(format!("{CATALOG_URI}/v1/final"))
+            .header(AUTHORIZATION, "Bearer token")
+            .header("x-signed-path", "/v1/final")
             .respond(StatusCode::OK, ""),
     );
+    let config =
+        RestCatalogConfig::for_test(CATALOG_URI, HashMap::new(), transport.clone());
+    let client = HttpClient::new(&config).unwrap();
+    client
+        .query_catalog(
+            &PathSession,
+            HttpRequest::new(
+                Method::GET,
+                format!("{CATALOG_URI}/v1/start").parse().unwrap(),
+            ),
+        )
+        .unwrap();
+    transport.assert_finished();
+}
+
+#[test]
+fn post_form_is_never_authenticated_by_catalog_headers() {
+    let transport = Arc::new(MockHttpTransport::default());
     transport.expect(
         ExpectedExchange::post("https://auth.test/token")
             .missing_header(AUTHORIZATION)
             .respond(StatusCode::OK, ""),
     );
-    let config =
-        RestCatalogConfig::for_test(CATALOG_URI, HashMap::new(), transport.clone());
-    let client = HttpClient::new(&config)
+    let config = RestCatalogConfig::for_test(
+        CATALOG_URI,
+        HashMap::from([("header.authorization".to_owned(), "Basic xyz".to_owned())]),
+        transport.clone(),
+    );
+    HttpClient::new(&config)
         .unwrap()
-        .with_auth_session(Arc::new(StaticSession));
-
-    client
-        .post_form(
-            "https://auth.test/token",
-            &HeaderMap::new(),
-            &HashMap::new(),
-        )
-        .unwrap();
-    client
-        .without_auth_session()
         .post_form(
             "https://auth.test/token",
             &HeaderMap::new(),

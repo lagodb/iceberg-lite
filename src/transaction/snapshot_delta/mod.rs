@@ -27,12 +27,12 @@ use crate::overlay::{
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, FirstRowIdInheritance, FormatVersion,
     MAIN_BRANCH, Manifest, ManifestContentType, ManifestFile, ManifestListWriter,
-    ManifestWriter, ManifestWriterBuilder, Operation, PartitionSpecRef, Snapshot,
-    SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct,
+    ManifestWriter, ManifestWriterBuilder, Operation, PartitionSpecRef, SchemaRef,
+    Snapshot, SnapshotReference, SnapshotRetention, SnapshotSummaryCollector, Struct,
     StructType, Summary, update_snapshot_summaries,
 };
 use crate::table::Table;
-use crate::transaction::{ActionCommit, TransactionAction};
+use crate::transaction::{ActionCommit, StatelessAction};
 use crate::{Error, ErrorKind, Result, TableRequirement, TableUpdate};
 
 mod inventory;
@@ -51,6 +51,7 @@ pub(super) use plan::DeltaPlan;
 /// append/delete/remove deltas. [`super::append::FastAppendAction`] remains as
 /// the upstream-compatible pure append API for callers that do not use overlay
 /// semantics.
+#[derive(Clone)]
 pub struct SnapshotDeltaAction {
     delta: Arc<SnapshotDelta>,
     truncate_base: bool,
@@ -99,8 +100,8 @@ impl SnapshotDeltaAction {
     }
 }
 
-impl TransactionAction for SnapshotDeltaAction {
-    fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+impl StatelessAction for SnapshotDeltaAction {
+    fn commit(&self, table: &Table) -> Result<ActionCommit> {
         let plan =
             DeltaPlan::from_delta_with_truncate(&self.delta, self.truncate_base);
         if plan.is_empty() {
@@ -453,7 +454,7 @@ impl<'a> DeltaSnapshotProducer<'a> {
             if let Some(manifest) = &current.manifest {
                 let rewritten = self.rewrite_manifest(
                     &current.manifest_file,
-                    manifest.entries(),
+                    manifest,
                     removals,
                     &mut found_removed_paths,
                     &mut found_removed_delete_files,
@@ -511,20 +512,23 @@ impl<'a> DeltaSnapshotProducer<'a> {
     fn rewrite_manifest(
         &mut self,
         manifest_file: &ManifestFile,
-        entries: &[Arc<crate::spec::ManifestEntry>],
+        manifest: &Manifest,
         removals: &SnapshotDeltaRemovals,
         found_removed_paths: &mut HashSet<String>,
         found_removed_delete_files: &mut HashSet<DeleteFileIdentity>,
         summary_collector: &mut SnapshotSummaryCollector,
     ) -> Result<ManifestFile> {
+        let schema = manifest.metadata().schema();
+        let partition_spec = self.partition_spec(manifest_file.partition_spec_id)?;
         let mut writer = self.new_manifest_writer(
             manifest_file.content,
-            manifest_file.partition_spec_id,
+            Arc::clone(schema),
+            Arc::clone(&partition_spec),
         )?;
         let mut row_id_inheritance =
             FirstRowIdInheritance::new(manifest_file.first_row_id);
 
-        for entry in entries {
+        for entry in manifest.entries() {
             let effective_first_row_id = row_id_inheritance.resolve(entry)?;
             if !entry.is_alive() {
                 continue;
@@ -598,7 +602,11 @@ impl<'a> DeltaSnapshotProducer<'a> {
                     sequence_number,
                     Some(file_sequence_number),
                 )?;
-                self.collect_removed_file(summary_collector, entry.data_file())?;
+                summary_collector.remove_file(
+                    entry.data_file(),
+                    Arc::clone(schema),
+                    Arc::clone(&partition_spec),
+                );
             } else {
                 writer.add_existing_file(
                     data_file,
@@ -633,7 +641,11 @@ impl<'a> DeltaSnapshotProducer<'a> {
         }
 
         for (spec_id, grouped_files) in files_by_spec {
-            let mut writer = self.new_manifest_writer(content, spec_id)?;
+            let mut writer = self.new_manifest_writer(
+                content,
+                self.table.metadata().current_schema().clone(),
+                self.partition_spec(spec_id)?,
+            )?;
             for file in grouped_files {
                 self.collect_added_file(summary_collector, &file)?;
                 writer.add_file(file, added_sequence_number)?;
@@ -655,13 +667,10 @@ impl<'a> DeltaSnapshotProducer<'a> {
             .table
             .file_io()
             .new_output(manifest_list_path.clone())?;
-        let (manifest_list_output, encryption_key_id) =
+        let (manifest_list_output, encrypted_output) =
             if let Some(manager) = self.table.encryption_manager() {
                 let encrypted_output = manager.encrypt(raw_output);
-                let encryption_key_id = manager.encrypt_manifest_list_key_metadata(
-                    encrypted_output.key_metadata(),
-                )?;
-                (encrypted_output.writer()?, Some(encryption_key_id))
+                (encrypted_output.writer()?, Some(encrypted_output))
             } else {
                 (raw_output.create_file_writer()?, None)
             };
@@ -692,7 +701,17 @@ impl<'a> DeltaSnapshotProducer<'a> {
 
         writer.add_manifests(manifests.into_iter())?;
         let writer_next_row_id = writer.next_row_id();
-        writer.close()?;
+        let file_metadata = writer.close()?;
+        let encryption_key_id = encrypted_output
+            .map(|output| {
+                self.table
+                    .encryption_manager()
+                    .expect("encrypted output has an encryption manager")
+                    .encrypt_manifest_list_key_metadata(
+                        &output.key_metadata_with_saved_file_metadata(&file_metadata),
+                    )
+            })
+            .transpose()?;
         Ok(ManifestListOutput {
             path: manifest_list_path,
             next_row_id: writer_next_row_id,
@@ -781,24 +800,11 @@ impl<'a> DeltaSnapshotProducer<'a> {
         Ok(())
     }
 
-    fn collect_removed_file(
-        &self,
-        summary_collector: &mut SnapshotSummaryCollector,
-        data_file: &DataFile,
-    ) -> Result<()> {
-        let partition_spec = self.partition_spec(data_file.partition_spec_id)?;
-        summary_collector.remove_file(
-            data_file,
-            self.table.metadata().current_schema().clone(),
-            partition_spec,
-        );
-        Ok(())
-    }
-
     fn new_manifest_writer(
         &mut self,
         content: ManifestContentType,
-        partition_spec_id: i32,
+        schema: SchemaRef,
+        partition_spec: PartitionSpecRef,
     ) -> Result<ManifestWriter> {
         let manifest_counter = self.manifest_counter;
         self.manifest_counter = self
@@ -813,8 +819,6 @@ impl<'a> DeltaSnapshotProducer<'a> {
             DataFileFormat::Avro
         );
         let output_file = self.table.file_io().new_output(new_manifest_path)?;
-        let partition_spec = self.partition_spec(partition_spec_id)?;
-        let schema = self.table.metadata().current_schema().clone();
         let partition_spec = partition_spec.as_ref().clone();
         let builder = if let Some(manager) = self.table.encryption_manager() {
             ManifestWriterBuilder::new_from_encrypted(

@@ -39,11 +39,10 @@ use fnv::FnvHashSet;
 use parquet::schema::types::SchemaDescriptor;
 
 use crate::arrow::get_arrow_datum;
-use crate::error::Result;
+use crate::error::{Result, invalid_data};
 use crate::expr::visitors::bound_predicate_visitor::BoundPredicateVisitor;
 use crate::expr::{BoundPredicate, BoundReference};
 use crate::spec::Datum;
-use crate::{Error, ErrorKind};
 
 /// A visitor to collect field ids from bound predicates.
 pub(super) struct CollectFieldIdVisitor {
@@ -276,12 +275,9 @@ impl PredicateConverter<'_> {
                 // The leaf column's index in Parquet schema.
                 if let Some(column_idx) = column_map.get(&reference.field().id) {
                     if parquet_schema.get_column_root(*column_idx).is_group() {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Leaf column `{}` in predicates isn't a root column in Parquet schema.",
-                                reference.field().name
-                            ),
+                        return Err(invalid_data!(
+                            "Leaf column `{}` in predicates isn't a root column in Parquet schema.",
+                            reference.field().name
                         ));
                     }
 
@@ -289,12 +285,9 @@ impl PredicateConverter<'_> {
                     let index = column_indices
                         .iter()
                         .position(|&idx| idx == *column_idx)
-                        .ok_or(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
+                        .ok_or(invalid_data!(
                                 "Leaf column `{}` in predicates cannot be found in the required column indices.",
                                 reference.field().name
-                            ),
                         ))?;
 
                     Ok(Some(index))

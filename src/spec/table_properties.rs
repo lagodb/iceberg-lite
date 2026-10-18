@@ -417,6 +417,11 @@ impl<'a> TableProperties<'a> {
         "write.folder-storage.path";
     pub const PROPERTY_WRITE_OBJECT_STORAGE_LOCATION: &'static str =
         "write.object-storage.path";
+    /// Property key for enabling the object storage location layout for new data files.
+    pub const PROPERTY_WRITE_OBJECT_STORAGE_ENABLED: &'static str =
+        "write.object-storage.enabled";
+    /// Default value for [`TableProperties::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED`].
+    pub const PROPERTY_WRITE_OBJECT_STORAGE_ENABLED_DEFAULT: bool = false;
     pub const PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS: &'static str =
         "write.object-storage.partitioned-paths";
     pub const PROPERTY_WRITE_OBJECT_STORAGE_PARTITIONED_PATHS_DEFAULT: bool = true;
@@ -649,6 +654,15 @@ impl<'a> TableProperties<'a> {
         parse_location_property(
             self.properties,
             Self::PROPERTY_WRITE_OBJECT_STORAGE_LOCATION,
+        )
+    }
+
+    /// Whether new data files use the object storage layout with hash entropy.
+    pub fn write_object_storage_enabled(&self) -> Result<bool> {
+        parse_property_bool(
+            self.properties,
+            Self::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED,
+            Self::PROPERTY_WRITE_OBJECT_STORAGE_ENABLED_DEFAULT,
         )
     }
 

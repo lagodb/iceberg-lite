@@ -15,14 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
+//! Serde forms of manifest entries.
+//!
+//! `Manifest::parse_avro` deserializes these structs from the writer schema
+//! without a reader schema, so they decide which manifests read. A field that
+//! a writer may omit, per the spec's read rules for every format version the
+//! struct reads, must be an `Option` or have `#[serde(default)]`.
+//! `test_parse_manifest_without_each_field` and
+//! `test_parse_v1_manifest_without_each_field` check each field.
+
 use std::collections::HashMap;
 
 use serde_derive::{Deserialize, Serialize};
 use serde_with::serde_as;
 
 use super::{Datum, ManifestEntry, Schema, Struct};
+use crate::error::invalid_data;
 use crate::spec::{FormatVersion, Literal, RawLiteral, Type};
-use crate::{Error, ErrorKind, metadata_columns};
+use crate::{Error, metadata_columns};
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct ManifestEntryV2 {
@@ -62,11 +72,10 @@ impl ManifestEntryV2 {
             snapshot_id: self.snapshot_id,
             sequence_number: self.sequence_number,
             file_sequence_number: self.file_sequence_number,
-            data_file: self.data_file.try_into(
-                partition_spec_id,
-                partition_type,
-                schema,
-            )?,
+            data_file: self
+                .data_file
+                .project_partition_by_name(partition_type)?
+                .try_into(partition_spec_id, partition_type, schema)?,
         })
     }
 }
@@ -74,6 +83,8 @@ impl ManifestEntryV2 {
 #[derive(Serialize, Deserialize)]
 pub(super) struct ManifestEntryV1 {
     status: i32,
+    // Required in v1 by the spec. Java declares it optional and writes null when
+    // snapshot ID inheritance is enabled, which #3371 tracks.
     pub snapshot_id: i64,
     data_file: DataFileSerde,
 }
@@ -105,11 +116,10 @@ impl ManifestEntryV1 {
             snapshot_id: Some(self.snapshot_id),
             sequence_number: Some(0),
             file_sequence_number: Some(0),
-            data_file: self.data_file.try_into(
-                partition_spec_id,
-                partition_type,
-                schema,
-            )?,
+            data_file: self
+                .data_file
+                .project_partition_by_name(partition_type)?
+                .try_into(partition_spec_id, partition_type, schema)?,
         })
     }
 }
@@ -181,6 +191,19 @@ impl DataFileSerde {
         })
     }
 
+    /// Matches the partition value's fields to `partition_type` by name. Manifest
+    /// entries are deserialized with the writer's partition fields and order,
+    /// which can differ from the partition spec's.
+    fn project_partition_by_name(
+        mut self,
+        partition_type: &Type,
+    ) -> Result<Self, Error> {
+        if let Type::Struct(struct_type) = partition_type {
+            self.partition = self.partition.project_by_name(struct_type)?;
+        }
+        Ok(self)
+    }
+
     pub fn try_into(
         self,
         partition_spec_id: i32,
@@ -194,10 +217,7 @@ impl DataFileSerde {
                 if let Literal::Struct(v) = v {
                     Ok(v)
                 } else {
-                    Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        "partition value is not a struct",
-                    ))
+                    Err(invalid_data!("partition value is not a struct"))
                 }
             })
             .transpose()?
@@ -276,10 +296,7 @@ fn parse_bytes_entry(
                 .field_type
                 .as_primitive_type()
                 .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("field {} is not a primitive type", field.name),
-                    )
+                    invalid_data!("field {} is not a primitive type", field.name)
                 })?
                 .clone();
             m.insert(entry.key, Datum::try_from_bytes(&entry.value, data_type)?);
@@ -348,11 +365,12 @@ mod tests {
     use std::io::Cursor;
     use std::sync::Arc;
 
+    use crate::avro::define_named_types_repeatedly;
     use crate::spec::manifest::_serde::{I64Entry, parse_i64_entry};
     use crate::spec::{
-        DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, NestedField,
-        PrimitiveType, Schema, Struct, StructType, Type, read_data_files_from_avro,
-        write_data_files_to_avro,
+        DataContentType, DataFile, DataFileFormat, Datum, FormatVersion, Literal,
+        NestedField, PrimitiveType, Schema, Struct, StructType, Type,
+        read_data_files_from_avro, write_data_files_to_avro,
     };
 
     #[test]
@@ -443,6 +461,54 @@ mod tests {
         .unwrap();
 
         assert_eq!(data_files, actual_data_file);
+    }
+
+    /// apache-avro 0.22 checks the writer schema for repeated names only when
+    /// the reader has no reader schema, so this path reads 0.21 output without
+    /// the header rewrite that `Manifest::parse_avro` needs.
+    #[test]
+    fn test_read_data_files_with_repeated_named_type_definitions() {
+        let decimal = Type::Primitive(PrimitiveType::Decimal {
+            precision: 10,
+            scale: 2,
+        });
+        let schema = Schema::builder()
+            .with_fields(schema().as_struct().fields().to_vec())
+            .with_fields(vec![
+                NestedField::optional(4, "a", decimal.clone()).into(),
+                NestedField::optional(5, "b", decimal.clone()).into(),
+            ])
+            .build()
+            .unwrap();
+        let partition_type = StructType::new(vec![
+            NestedField::optional(1000, "a", decimal.clone()).into(),
+            NestedField::optional(1001, "b", decimal).into(),
+        ]);
+        let mut data_files = data_files();
+        data_files[0].partition = Struct::from_iter([
+            Some(Literal::decimal(12345)),
+            Some(Literal::decimal(-678)),
+        ]);
+        let mut buffer = Vec::new();
+        write_data_files_to_avro(
+            &mut buffer,
+            data_files.clone(),
+            &partition_type,
+            FormatVersion::V2,
+        )
+        .unwrap();
+        let legacy = define_named_types_repeatedly(&buffer);
+
+        let actual = read_data_files_from_avro(
+            &mut Cursor::new(legacy),
+            &schema,
+            0,
+            &partition_type,
+            FormatVersion::V2,
+        )
+        .unwrap();
+
+        assert_eq!(actual, data_files);
     }
 
     #[test]

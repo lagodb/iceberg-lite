@@ -21,7 +21,7 @@ use std::sync::Arc;
 use crate::encryption::EncryptionManager;
 use crate::io::FileIO;
 use crate::spec::{
-    FormatVersion, Manifest, ManifestFile, ManifestList, ManifestReader, SnapshotRef,
+    Manifest, ManifestFile, ManifestList, ManifestReader, SnapshotRef,
     TableMetadataRef,
 };
 use crate::{Error, ErrorKind, Result};
@@ -36,7 +36,7 @@ pub(crate) enum CachedItem {
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq)]
 pub(crate) enum CachedObjectKey {
-    ManifestList((String, FormatVersion)),
+    ManifestList(String),
     Manifest((String, Option<u64>)),
 }
 
@@ -176,10 +176,7 @@ impl ObjectCache {
                 .map(Arc::new);
         }
 
-        let key = CachedObjectKey::ManifestList((
-            snapshot.manifest_list().to_string(),
-            table_metadata.format_version,
-        ));
+        let key = CachedObjectKey::ManifestList(snapshot.manifest_list().to_string());
         let cache_entry = self
             .cache
             .try_get_with(key.clone(), || {

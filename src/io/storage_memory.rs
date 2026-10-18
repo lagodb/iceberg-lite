@@ -185,7 +185,8 @@ impl std::io::Write for MemoryFileWrite {
 }
 
 impl FileWrite for MemoryFileWrite {
-    fn close(&mut self) -> Result<()> {
+    fn close(&mut self) -> Result<FileMetadata> {
+        let size = self.buffer.len() as u64;
         let mut fs = self
             .fs
             .write()
@@ -194,6 +195,6 @@ impl FileWrite for MemoryFileWrite {
             self.path.clone(),
             Bytes::from(std::mem::take(&mut self.buffer)),
         );
-        Ok(())
+        Ok(FileMetadata { size })
     }
 }

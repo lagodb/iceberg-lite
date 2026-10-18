@@ -15,15 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::io::Cursor;
+//! Deletion vectors decoded from Iceberg Puffin `deletion-vector-v1` blobs.
+
 use std::ops::BitOrAssign;
 
-use roaring::RoaringTreemap;
+use bytes::Buf;
 use roaring::bitmap::Iter;
 use roaring::treemap::BitmapIter;
+use roaring::{RoaringBitmap, RoaringTreemap};
 
+use crate::error::invalid_data;
 use crate::{Error, ErrorKind, Result};
 
+/// The deleted row positions of one data file, stored as a 64-bit bitmap.
 #[derive(Debug, Default)]
 pub struct DeleteVector {
     inner: RoaringTreemap,
@@ -38,22 +42,25 @@ impl DeleteVector {
         + Self::PUFFIN_V1_MAGIC_SIZE
         + Self::PUFFIN_V1_CRC_SIZE;
 
-    #[allow(unused)]
+    /// Wraps a bitmap whose members are the deleted positions.
     pub fn new(roaring_treemap: RoaringTreemap) -> DeleteVector {
         DeleteVector {
             inner: roaring_treemap,
         }
     }
 
+    /// Iterates the deleted positions in ascending order.
     pub fn iter(&self) -> DeleteVectorIterator<'_> {
         let outer = self.inner.bitmaps();
         DeleteVectorIterator { outer, inner: None }
     }
 
+    /// Marks `pos` as deleted, returning whether it was newly inserted.
     pub fn insert(&mut self, pos: u64) -> bool {
         self.inner.insert(pos)
     }
 
+    /// Returns whether no position is deleted.
     pub fn is_empty(&self) -> bool {
         self.inner.is_empty()
     }
@@ -76,15 +83,17 @@ impl DeleteVector {
         Ok(positions.len())
     }
 
-    #[allow(unused)]
+    /// Returns the number of deleted positions.
     pub fn len(&self) -> u64 {
         self.inner.len()
     }
 
+    /// Returns the number of deleted positions.
     pub fn cardinality(&self) -> u64 {
         self.len()
     }
 
+    /// Adds the deleted positions from `other` without consuming it.
     pub fn merge_ref(&mut self, other: &DeleteVector) {
         self.inner.bitor_assign(&other.inner);
     }
@@ -129,17 +138,14 @@ impl DeleteVector {
         Ok(bytes)
     }
 
-    /// Deserialize Iceberg Puffin `deletion-vector-v1` bytes.
+    /// Decodes a Puffin `deletion-vector-v1` blob without requiring its metadata.
     ///
     /// # Errors
     ///
-    /// Returns an error if the byte envelope is malformed, the CRC does not
-    /// match, the Roaring bitmap is invalid, or the decoded cardinality does
-    /// not match `expected_cardinality`.
-    pub fn from_puffin_v1_bytes(
-        bytes: &[u8],
-        expected_cardinality: u64,
-    ) -> Result<Self> {
+    /// Returns [`ErrorKind::DataInvalid`] for invalid framing, CRC, magic,
+    /// bitmap count, unordered or duplicate directory keys, malformed bitmaps,
+    /// or trailing bytes in the Roaring payload.
+    pub fn deserialize(bytes: &[u8]) -> Result<Self> {
         if bytes.len() < Self::PUFFIN_V1_MIN_SIZE {
             return Err(Error::new(
                 ErrorKind::DataInvalid,
@@ -204,34 +210,55 @@ impl DeleteVector {
             ));
         }
 
-        let roaring_bytes = &content[Self::PUFFIN_V1_MAGIC_SIZE..];
-        let mut cursor = Cursor::new(roaring_bytes);
-        let inner = RoaringTreemap::deserialize_from(&mut cursor).map_err(|err| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                "failed to deserialize deletion vector roaring bitmap",
-            )
-            .with_source(err)
+        let inner =
+            Self::decode_roaring_directory(&content[Self::PUFFIN_V1_MAGIC_SIZE..])?;
+        Ok(DeleteVector { inner })
+    }
+
+    fn decode_roaring_directory(mut reader: &[u8]) -> Result<RoaringTreemap> {
+        let bitmap_count = reader.try_get_u64_le().map_err(|e| {
+            invalid_data!("failed to decode deletion-vector-v1 roaring payload")
+                .with_source(e)
         })?;
-        if cursor.position() != roaring_bytes.len() as u64 {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "deletion vector roaring bitmap has trailing bytes",
+        if bitmap_count > u64::from(u32::MAX) {
+            return Err(invalid_data!(
+                "deletion-vector-v1 roaring bitmap count {bitmap_count} exceeds the {}-key maximum",
+                u32::MAX
             ));
         }
 
-        let delete_vector = DeleteVector { inner };
-        if delete_vector.cardinality() != expected_cardinality {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "deletion vector cardinality mismatch: expected {expected_cardinality}, actual {}",
-                    delete_vector.cardinality()
-                ),
+        let mut bitmaps = Vec::new();
+        let mut last_key = None;
+        for _ in 0..bitmap_count {
+            let key = reader.try_get_u32_le().map_err(|e| {
+                invalid_data!("failed to decode deletion-vector-v1 roaring payload")
+                    .with_source(e)
+            })?;
+            if let Some(last) = last_key
+                && key <= last
+            {
+                return Err(invalid_data!(
+                    "deletion-vector-v1 roaring keys must be ordered by unsigned comparison, got key {key} after {last}"
+                ));
+            }
+            last_key = Some(key);
+
+            let bitmap =
+                RoaringBitmap::deserialize_from(&mut reader).map_err(|e| {
+                    invalid_data!(
+                        "failed to decode deletion-vector-v1 roaring payload"
+                    )
+                    .with_source(e)
+                })?;
+            bitmaps.push((key, bitmap));
+        }
+        if !reader.is_empty() {
+            return Err(invalid_data!(
+                "deletion vector roaring bitmap has trailing bytes"
             ));
         }
 
-        Ok(delete_vector)
+        Ok(RoaringTreemap::from_bitmaps(bitmaps))
     }
 
     fn read_u32_be(bytes: &[u8], name: &str) -> Result<u32> {
@@ -261,6 +288,7 @@ impl DeleteVector {
 // There is a PR open on roaring to add this (https://github.com/RoaringBitmap/roaring-rs/pull/314)
 // and if that gets merged then we can simplify `DeleteVectorIterator` here, refactoring `advance_to`
 // to just a wrapper around the underlying iterator's method.
+/// Iterates the deleted positions of a [`DeleteVector`] in ascending order.
 pub struct DeleteVectorIterator<'a> {
     // NB: `BitMapIter` was only exposed publicly in https://github.com/RoaringBitmap/roaring-rs/pull/316
     // which is not yet released. As a consequence our Cargo.toml temporarily uses a git reference for
@@ -298,6 +326,8 @@ impl Iterator for DeleteVectorIterator<'_> {
 }
 
 impl DeleteVectorIterator<'_> {
+    /// Skips positions below `pos` after iteration has started.
+    /// Does nothing before the first position is yielded.
     pub fn advance_to(&mut self, pos: u64) {
         let hi = (pos >> 32) as u32;
         let lo = pos as u32;
@@ -392,19 +422,15 @@ mod tests {
 
     #[test]
     fn test_puffin_v1_round_trip() {
-        let mut dv = DeleteVector::default();
-        for pos in [0, 1, 42, u64::from(u32::MAX) + 3, 1 << 40] {
-            dv.insert(pos);
+        for positions in [vec![], vec![0, 1, 42, u64::from(u32::MAX) + 3, 1 << 40]] {
+            let mut dv = DeleteVector::default();
+            for &pos in &positions {
+                dv.insert(pos);
+            }
+            let bytes = dv.to_puffin_v1_bytes().unwrap();
+            let decoded = DeleteVector::deserialize(&bytes).unwrap();
+            assert_eq!(decoded.iter().collect::<Vec<_>>(), positions);
         }
-
-        let bytes = dv.to_puffin_v1_bytes().unwrap();
-        let decoded =
-            DeleteVector::from_puffin_v1_bytes(&bytes, dv.cardinality()).unwrap();
-
-        assert_eq!(
-            decoded.iter().collect::<Vec<_>>(),
-            dv.iter().collect::<Vec<_>>()
-        );
     }
 
     #[test]
@@ -417,18 +443,105 @@ mod tests {
             + 1;
         bytes[payload_index] ^= 0x01;
 
+        let err = DeleteVector::deserialize(&bytes).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    fn frame_dv_blob(vector: &[u8]) -> Vec<u8> {
+        let body_len = DeleteVector::PUFFIN_V1_MAGIC_SIZE + vector.len();
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&u32::try_from(body_len).unwrap().to_be_bytes());
+        blob.extend_from_slice(&DeleteVector::PUFFIN_V1_MAGIC.to_le_bytes());
+        blob.extend_from_slice(vector);
+        let crc = crc32fast::hash(&blob[DeleteVector::PUFFIN_V1_LENGTH_SIZE..]);
+        blob.extend_from_slice(&crc.to_be_bytes());
+        blob
+    }
+
+    fn raw_roaring_vector(entries: &[(u32, &[u32])]) -> Vec<u8> {
+        let mut vector = Vec::new();
+        vector.extend_from_slice(&(entries.len() as u64).to_le_bytes());
+        for (key, positions) in entries {
+            let bitmap: RoaringBitmap = positions.iter().copied().collect();
+            vector.extend_from_slice(&key.to_le_bytes());
+            bitmap.serialize_into(&mut vector).unwrap();
+        }
+        vector
+    }
+
+    #[test]
+    fn test_deserialize_roundtrip_run_optimized() {
+        let mut dv = DeleteVector::new((0..10_000).collect());
+        assert!(dv.inner.optimize());
+        let decoded =
+            DeleteVector::deserialize(&dv.to_puffin_v1_bytes().unwrap()).unwrap();
+        assert_eq!(
+            decoded.iter().collect::<Vec<_>>(),
+            (0..10_000).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_deserialize_rejects_short_blob() {
         let err =
-            DeleteVector::from_puffin_v1_bytes(&bytes, dv.cardinality()).unwrap_err();
+            DeleteVector::deserialize(&[0; DeleteVector::PUFFIN_V1_MIN_SIZE - 1])
+                .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
     }
 
     #[test]
-    fn test_puffin_v1_rejects_cardinality_mismatch() {
-        let mut dv = DeleteVector::default();
-        dv.insert(42);
-        let bytes = dv.to_puffin_v1_bytes().unwrap();
-
-        let err = DeleteVector::from_puffin_v1_bytes(&bytes, 2).unwrap_err();
+    fn test_deserialize_rejects_bad_magic() {
+        let mut blob = DeleteVector::default().to_puffin_v1_bytes().unwrap();
+        blob[DeleteVector::PUFFIN_V1_LENGTH_SIZE] ^= 0xFF;
+        let end = blob.len() - DeleteVector::PUFFIN_V1_CRC_SIZE;
+        let crc = crc32fast::hash(&blob[DeleteVector::PUFFIN_V1_LENGTH_SIZE..end]);
+        blob[end..].copy_from_slice(&crc.to_be_bytes());
+        let err = DeleteVector::deserialize(&blob).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("magic mismatch"));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_length_prefix_mismatch() {
+        let mut blob = DeleteVector::default().to_puffin_v1_bytes().unwrap();
+        blob[0] ^= 1;
+        let err = DeleteVector::deserialize(&blob).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("blob length mismatch"));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_duplicate_keys() {
+        let vector = raw_roaring_vector(&[(5, &[1]), (5, &[2])]);
+        let blob = frame_dv_blob(&vector);
+        let err = DeleteVector::deserialize(&blob).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("unsigned comparison"));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_out_of_order_keys() {
+        let vector = raw_roaring_vector(&[(5, &[1]), (3, &[2])]);
+        let blob = frame_dv_blob(&vector);
+        let err = DeleteVector::deserialize(&blob).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("unsigned comparison"));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_bitmap_count_overflow() {
+        let vector = (u64::from(u32::MAX) + 1).to_le_bytes();
+        let err = DeleteVector::deserialize(&frame_dv_blob(&vector)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("exceeds the"));
+    }
+
+    #[test]
+    fn test_deserialize_rejects_trailing_roaring_bytes() {
+        let mut vector = raw_roaring_vector(&[(5, &[1])]);
+        vector.push(0);
+        let err = DeleteVector::deserialize(&frame_dv_blob(&vector)).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+        assert!(err.message().contains("trailing bytes"));
     }
 }

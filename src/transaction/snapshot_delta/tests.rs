@@ -25,9 +25,11 @@ use crate::memory::tests::new_memory_catalog;
 use crate::overlay::SnapshotDelta;
 use crate::spec::{
     DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion,
-    Literal, ManifestStatus, Struct, TableMetadata,
+    Literal, ManifestStatus, NestedField, PartitionSpec, PrimitiveType, Schema,
+    Struct, TableMetadata, Transform, Type,
 };
 use crate::table::Table;
+use crate::test_utils::commit_with_fresh_state;
 use crate::transaction::tests::{
     make_v2_minimal_table, make_v3_minimal_table_in_catalog,
 };
@@ -193,7 +195,26 @@ fn snapshot_delta_position_delete_with_add_writes_delete_manifest() {
         )
         .unwrap();
 
-    let updated = commit_delta(&catalog, &table, delta);
+    // The generic writer leaves referenced_data_file unset; SnapshotDelta
+    // carries the association for both transaction-local reads and publication.
+    let delta = Arc::new(delta);
+    let overlay_tasks = table
+        .scan()
+        .with_delta(Arc::clone(&delta))
+        .build()
+        .unwrap()
+        .plan_files()
+        .unwrap();
+    assert_eq!(overlay_tasks.len(), 1);
+    assert_eq!(overlay_tasks[0].deletes.len(), 1);
+    assert_eq!(
+        overlay_tasks[0].deletes[0].referenced_data_file_path(),
+        Some("test/data-a.parquet")
+    );
+
+    let tx = Transaction::new(&table);
+    let tx = tx.snapshot_delta(delta).apply(tx).unwrap();
+    let updated = tx.commit(&catalog).unwrap();
 
     let tasks = updated.scan().build().unwrap().plan_files().unwrap();
     assert_eq!(tasks.len(), 1);
@@ -217,6 +238,82 @@ fn snapshot_delta_position_delete_with_add_writes_delete_manifest() {
         .count();
     assert_eq!(data_manifests, 1);
     assert_eq!(delete_manifests, 1);
+    let delete_manifest = manifest_list
+        .entries()
+        .iter()
+        .find(|entry| entry.content == ManifestContentType::Deletes)
+        .unwrap()
+        .load_manifest(updated.file_io())
+        .unwrap();
+    assert_eq!(
+        delete_manifest.entries()[0]
+            .data_file()
+            .referenced_data_file_path(),
+        Some("test/data-a.parquet")
+    );
+}
+
+#[test]
+fn snapshot_delta_position_delete_with_multiple_data_files() {
+    let catalog = new_memory_catalog();
+    let table = make_v2_table_in_catalog(&catalog);
+    let mut delta = SnapshotDelta::new();
+    for path in ["test/data-a.parquet", "test/data-b.parquet"] {
+        delta.add_data_file(data_file(path)).unwrap();
+    }
+    delta
+        .add_position_delete_file(
+            file_builder(DataContentType::PositionDeletes, "test/pos-ab.parquet")
+                .record_count(2)
+                .build()
+                .unwrap(),
+            ["test/data-a.parquet", "test/data-b.parquet"],
+        )
+        .unwrap();
+
+    let delta = Arc::new(delta);
+    let overlay_tasks = table
+        .scan()
+        .with_delta(Arc::clone(&delta))
+        .build()
+        .unwrap()
+        .plan_files()
+        .unwrap();
+    assert_eq!(overlay_tasks.len(), 2);
+    for task in &overlay_tasks {
+        assert_eq!(task.deletes.len(), 1);
+        assert_eq!(task.deletes[0].file_path, "test/pos-ab.parquet");
+        assert_eq!(
+            task.deletes[0].referenced_data_file_path(),
+            Some(task.data_file_path())
+        );
+    }
+
+    let tx = Transaction::new(&table);
+    let tx = tx.snapshot_delta(delta).apply(tx).unwrap();
+    let updated = tx.commit(&catalog).unwrap();
+    let tasks = updated.scan().build().unwrap().plan_files().unwrap();
+    assert_eq!(tasks.len(), 2);
+    for task in &tasks {
+        assert_eq!(task.deletes.len(), 1);
+        assert_eq!(task.deletes[0].file_path, "test/pos-ab.parquet");
+    }
+
+    let manifest_list = current_manifest_list(&updated);
+    let delete_manifest = manifest_list
+        .entries()
+        .iter()
+        .find(|entry| entry.content == ManifestContentType::Deletes)
+        .unwrap()
+        .load_manifest(updated.file_io())
+        .unwrap();
+    assert_eq!(delete_manifest.entries().len(), 1);
+    assert_eq!(
+        delete_manifest.entries()[0]
+            .data_file()
+            .referenced_data_file_path(),
+        None
+    );
 }
 
 #[test]
@@ -665,7 +762,7 @@ fn expire_snapshots_preserves_retained_refs_then_removes_aged_refs() {
         .expire_snapshots()
         .with_as_of_ms(newest_timestamp.saturating_add(1))
         .expire_older_than_ms(i64::MAX);
-    let mut commit = Arc::new(action).commit(&retained_table).unwrap();
+    let mut commit = commit_with_fresh_state(action, &retained_table).unwrap();
     let retained_updates = commit.take_updates();
     assert!(!retained_updates.iter().any(|update| {
         matches!(
@@ -704,7 +801,7 @@ fn expire_snapshots_preserves_retained_refs_then_removes_aged_refs() {
         .expire_snapshots()
         .with_as_of_ms(newest_timestamp.saturating_add(1))
         .expire_older_than_ms(i64::MAX);
-    let mut commit = Arc::new(action).commit(&aged_table).unwrap();
+    let mut commit = commit_with_fresh_state(action, &aged_table).unwrap();
     let aged_updates = commit.take_updates();
     assert!(aged_updates.iter().any(|update| {
         matches!(
@@ -745,7 +842,7 @@ fn explicit_expiration_overrides_branch_retention_but_not_ref_heads() {
         .expire_older_than_ms(i64::MIN)
         .retain_last(3)
         .expire_snapshot_ids([oldest_id]);
-    let mut commit = Arc::new(action).commit(&table).unwrap();
+    let mut commit = commit_with_fresh_state(action, &table).unwrap();
     let updates = commit.take_updates();
     let explicitly_removed = updates
         .iter()
@@ -781,8 +878,7 @@ fn explicit_expiration_overrides_branch_retention_but_not_ref_heads() {
         .expire_older_than_ms(i64::MIN)
         .retain_last(3)
         .expire_snapshot_ids([oldest_id]);
-    let error = Arc::new(action)
-        .commit(&tagged_table)
+    let error = commit_with_fresh_state(action, &tagged_table)
         .err()
         .expect("a retained ref head cannot be expired explicitly");
     assert_eq!(error.kind(), ErrorKind::DataInvalid);
@@ -852,4 +948,64 @@ fn file_builder(content: DataContentType, path: &str) -> DataFileBuilder {
         .partition_spec_id(0)
         .partition(Struct::from_iter([Some(Literal::long(300))]));
     builder
+}
+
+#[test]
+fn test_new_manifest_writer_uses_the_given_schema_and_spec() {
+    let table = make_v2_minimal_table();
+    let schema = Arc::new(
+        Schema::builder()
+            .with_schema_id(7)
+            .with_fields(vec![
+                NestedField::required(1, "a", Type::Primitive(PrimitiveType::Long))
+                    .into(),
+            ])
+            .build()
+            .unwrap(),
+    );
+    let partition_spec = Arc::new(
+        PartitionSpec::builder(schema.clone())
+            .with_spec_id(3)
+            .add_partition_field("a", "a", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap(),
+    );
+
+    let mut producer =
+        DeltaSnapshotProducer::new(&table, Uuid::now_v7(), HashMap::new());
+    let first = producer
+        .new_manifest_writer(
+            ManifestContentType::Data,
+            schema.clone(),
+            partition_spec.clone(),
+        )
+        .unwrap()
+        .write_manifest_file()
+        .unwrap();
+    let second = producer
+        .new_manifest_writer(
+            ManifestContentType::Data,
+            schema.clone(),
+            partition_spec,
+        )
+        .unwrap()
+        .write_manifest_file()
+        .unwrap();
+
+    assert_ne!(first.manifest_path, second.manifest_path);
+
+    let bytes = table
+        .file_io()
+        .new_input(&first.manifest_path)
+        .unwrap()
+        .read()
+        .unwrap();
+    let metadata = Manifest::parse_avro(&bytes).unwrap().into_parts().1;
+
+    // Not the table's defaults, which are schema 0 and spec 0.
+    assert_eq!(metadata.schema_id(), 7);
+    assert_eq!(metadata.schema().as_ref(), schema.as_ref());
+    assert_eq!(metadata.partition_spec().spec_id(), 3);
+    assert_eq!(first.partition_spec_id, 3);
 }

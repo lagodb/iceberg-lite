@@ -20,7 +20,7 @@
 //! Predicates over generated metadata columns cannot run until after record
 //! batch transformation. Physical top-level conjuncts are still safe to run
 //! as an exact Parquet row filter and can also be reused for row-group and
-//! page-index pruning. Mixed `OR` and `NOT` subtrees remain intact in the
+//! page-index pruning. After NOT normalization, mixed `OR` subtrees remain intact in the
 //! post-transform residual.
 //!
 //! TODO(metadata-column SQL): this planner deliberately accepts an already
@@ -58,6 +58,7 @@ impl FilePredicatePlan {
             });
         };
 
+        let predicate = predicate.rewrite_not();
         let field_ids = Self::collect_field_ids(&predicate)?;
         if field_ids
             .iter()
@@ -254,7 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn mixed_not_subtree_remains_whole_in_post_transform_residual() {
+    fn mixed_not_is_normalized_before_selecting_post_transform_residual() {
         let schema = Arc::new(
             Schema::builder()
                 .with_fields(vec![
@@ -283,6 +284,9 @@ mod tests {
         let plan = FilePredicatePlan::try_new(Some(predicate.clone())).unwrap();
 
         assert!(plan.parquet_filter_predicate().is_none());
-        assert_eq!(plan.into_post_transform_residual(), Some(predicate));
+        assert_eq!(
+            plan.into_post_transform_residual(),
+            Some(predicate.rewrite_not())
+        );
     }
 }

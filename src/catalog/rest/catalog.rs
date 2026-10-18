@@ -39,7 +39,8 @@ use crate::{
 };
 
 use super::auth::{
-    AUTH_TYPE_NONE, AUTH_TYPE_OAUTH2, AuthManager, NoopAuthManager, OAuth2Manager,
+    AUTH_TYPE_NONE, AUTH_TYPE_OAUTH2, AuthManager, AuthSession, NoopAuthManager,
+    OAuth2Manager,
 };
 use super::client::{
     HttpClient, HttpTransport, deserialize_catalog_response,
@@ -464,9 +465,9 @@ pub(crate) fn oauth_params_from_props(
 }
 
 #[derive(Debug)]
-struct RestClient {
-    /// Carries the session the auth manager derived from the merged
-    /// configuration, so every request below is authenticated.
+struct RestCatalogClient {
+    auth_manager: Arc<dyn AuthManager>,
+    catalog_session: Arc<dyn AuthSession>,
     http_client: HttpClient,
     /// Runtime config is fetched from rest server and stored here.
     ///
@@ -476,9 +477,9 @@ struct RestClient {
     endpoints: HashSet<Endpoint>,
 }
 
-impl RestClient {
-    /// Initializes the runtime config, advertised endpoints, and authentication
-    /// sessions shared by one REST catalog instance.
+impl RestCatalogClient {
+    /// Initializes the runtime config, advertised endpoints, auth manager, and
+    /// catalog authentication session shared by one REST catalog instance.
     fn init(
         user_config: &RestCatalogConfig,
         auth_manager: Arc<dyn AuthManager>,
@@ -488,14 +489,9 @@ impl RestClient {
         // manager whose session guards a one-shot resource can release
         // it before deriving the catalog session.
         let catalog_config = {
-            let init_session = auth_manager.init_session(
-                &http_client.without_auth_session(),
-                &Self::auth_props(user_config),
-            )?;
-            Self::load_config(
-                &http_client.with_auth_session(Arc::from(init_session)),
-                user_config,
-            )?
+            let init_session = auth_manager
+                .init_session(&http_client, &Self::auth_props(user_config))?;
+            Self::load_config(&http_client, init_session.as_ref(), user_config)?
         };
         // Use the advertised endpoints as-is, falling back to
         // `DEFAULT_ENDPOINTS` when absent or empty.
@@ -509,21 +505,28 @@ impl RestClient {
         let http_client = http_client.update_with(&config)?;
         // The manager is handed an unauthenticated client: its own
         // requests must not be signed by the session it is deriving.
-        let session = auth_manager.catalog_session(
-            &http_client.without_auth_session(),
-            &Self::auth_props(&config),
-        )?;
+        let catalog_session =
+            auth_manager.catalog_session(&http_client, &Self::auth_props(&config))?;
 
         Ok(Self {
+            auth_manager,
+            catalog_session,
             config,
-            http_client: http_client.with_auth_session(session),
+            http_client,
             endpoints,
         })
     }
 
-    /// Sends `request`, authenticated by the client's session.
-    fn query_catalog(&self, request: HttpRequest) -> Result<Response> {
-        self.http_client.query_catalog(request)
+    /// Sends `request` with the authentication derived for `context`.
+    fn query_catalog(
+        &self,
+        context: &SessionContext,
+        request: HttpRequest,
+    ) -> Result<Response> {
+        let session = self
+            .auth_manager
+            .contextual_session(context, Arc::clone(&self.catalog_session))?;
+        self.http_client.query_catalog(session.as_ref(), request)
     }
 
     /// The properties handed to the [`AuthManager`], with the catalog `uri`
@@ -547,6 +550,7 @@ impl RestClient {
     /// It's required for a REST catalog to update its config after creation.
     fn load_config(
         http_client: &HttpClient,
+        auth_session: &dyn AuthSession,
         user_config: &RestCatalogConfig,
     ) -> Result<CatalogConfig> {
         let mut request_builder =
@@ -559,7 +563,7 @@ impl RestClient {
 
         let request = HttpRequest::build(request_builder)?;
 
-        let http_response = http_client.query_catalog(request)?;
+        let http_response = http_client.query_catalog(auth_session, request)?;
 
         match http_response.status() {
             StatusCode::OK => deserialize_catalog_response(http_response),
@@ -613,7 +617,8 @@ impl RestCatalog {
     /// Returns the transport or catalog error. A caller invoking this after a
     /// local database commit must report the error without attempting rollback.
     pub fn send_prepared_commit(&self, commit: PreparedRestCommit) -> Result<()> {
-        self.inner.send_prepared_commit(commit)
+        self.inner
+            .send_prepared_commit(&self.session_context, commit)
     }
 }
 
@@ -710,18 +715,20 @@ impl Catalog for RestCatalog {
 
 /// REST catalog implementation of [`SessionCatalog`].
 ///
-/// Each operation accepts a [`SessionContext`]. REST configuration, authentication sessions,
-/// and the HTTP client are initialized lazily once per catalog and shared across all operations.
+/// Each operation accepts a [`SessionContext`]. REST configuration, the auth manager, the catalog
+/// authentication session, and the HTTP client are initialized lazily once per catalog. Each
+/// REST request uses the contextual authentication session returned by the manager.
 #[derive(Debug)]
 pub struct RestSessionCatalog {
-    /// Injected through [`RestSessionCatalogBuilder::with_auth_manager`]; otherwise
-    /// one is resolved from `rest.auth.type` when the client is built.
-    auth_manager: Option<Arc<dyn AuthManager>>,
+    /// Builder-supplied override retained so lazy client initialization can
+    /// clone it into the runtime state. When absent, a manager is resolved from
+    /// `rest.auth.type` during initialization.
+    auth_manager_override: Option<Arc<dyn AuthManager>>,
     /// User config is stored as-is and never changed.
     ///
     /// It could be different from the config fetched from the server and used at runtime.
     user_config: RestCatalogConfig,
-    client: OnceCell<RestClient>,
+    client: OnceCell<RestCatalogClient>,
     /// Storage factory for creating FileIO instances.
     storage_factory: Option<Arc<dyn StorageFactory>>,
     /// Optional KMS client for encrypted tables.
@@ -732,12 +739,12 @@ impl RestSessionCatalog {
     /// Creates a `RestSessionCatalog` from a [`RestCatalogConfig`].
     fn new(
         config: RestCatalogConfig,
-        auth_manager: Option<Box<dyn AuthManager>>,
+        auth_manager_override: Option<Box<dyn AuthManager>>,
         storage_factory: Option<Arc<dyn StorageFactory>>,
         kms_client: Option<Arc<dyn KeyManagementClient>>,
     ) -> Self {
         Self {
-            auth_manager: auth_manager.map(Arc::from),
+            auth_manager_override: auth_manager_override.map(Arc::from),
             user_config: config,
             client: OnceCell::new(),
             storage_factory,
@@ -748,7 +755,7 @@ impl RestSessionCatalog {
     /// Sends a DELETE request for the given table, optionally requesting purge.
     fn delete_table(
         &self,
-        _context: &SessionContext,
+        context: &SessionContext,
         table: &TableIdent,
         purge: bool,
     ) -> Result<()> {
@@ -763,7 +770,7 @@ impl RestSessionCatalog {
         }
 
         let request = HttpRequest::build(request_builder)?;
-        let http_response = client.query_catalog(request)?;
+        let http_response = client.query_catalog(context, request)?;
 
         match http_response.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
@@ -803,7 +810,7 @@ impl RestSessionCatalog {
     /// Resolves the auth manager: a `with_auth_manager` override wins,
     /// otherwise one is built from the `rest.auth.type` configuration.
     fn resolve_auth_manager(&self) -> Result<Arc<dyn AuthManager>> {
-        if let Some(auth_manager) = &self.auth_manager {
+        if let Some(auth_manager) = &self.auth_manager_override {
             return Ok(auth_manager.clone());
         }
         let config = &self.user_config;
@@ -832,10 +839,10 @@ impl RestSessionCatalog {
         }
     }
 
-    /// Gets the [`RestClient`] from the catalog.
-    fn client(&self) -> Result<&RestClient> {
+    /// Gets the [`RestCatalogClient`] from the catalog.
+    fn client(&self) -> Result<&RestCatalogClient> {
         self.client.get_or_try_init(|| {
-            RestClient::init(&self.user_config, self.resolve_auth_manager()?)
+            RestCatalogClient::init(&self.user_config, self.resolve_auth_manager()?)
         })
     }
 
@@ -850,12 +857,13 @@ impl RestSessionCatalog {
     /// `2xx` means it exists, `404` means it doesn't.
     fn check_exists_via_head(
         &self,
-        client: &RestClient,
+        context: &SessionContext,
+        client: &RestCatalogClient,
         url: String,
     ) -> Result<bool> {
         let request =
             HttpRequest::build(client.http_client.request(Method::HEAD, url))?;
-        let http_response = client.query_catalog(request)?;
+        let http_response = client.query_catalog(context, request)?;
 
         match http_response.status() {
             StatusCode::NOT_FOUND => Ok(false),
@@ -915,14 +923,18 @@ impl RestSessionCatalog {
     /// This is shared by `load_table` and the GET fallback for `table_exists`:
     /// existence checks must not depend on whether the caller configured a
     /// storage factory or whether vended object-store credentials are usable.
-    fn fetch_table(&self, table_ident: &TableIdent) -> Result<Response> {
+    fn fetch_table(
+        &self,
+        context: &SessionContext,
+        table_ident: &TableIdent,
+    ) -> Result<Response> {
         let client = self.client()?;
         let request = HttpRequest::build(
             client
                 .http_client
                 .request(Method::GET, client.config.table_endpoint(table_ident)),
         )?;
-        client.query_catalog(request)
+        client.query_catalog(context, request)
     }
 }
 
@@ -931,7 +943,7 @@ impl RestSessionCatalog {
 impl SessionCatalog for RestSessionCatalog {
     fn list_namespaces(
         &self,
-        _context: &SessionContext,
+        context: &SessionContext,
         parent: Option<&NamespaceIdent>,
     ) -> Result<Vec<NamespaceIdent>> {
         let client = self.client()?;
@@ -952,7 +964,8 @@ impl SessionCatalog for RestSessionCatalog {
                 request = request.query(&[("pageToken", token)]);
             }
 
-            let http_response = client.query_catalog(HttpRequest::build(request)?)?;
+            let http_response =
+                client.query_catalog(context, HttpRequest::build(request)?)?;
 
             match http_response.status() {
                 StatusCode::OK => {
@@ -987,7 +1000,7 @@ impl SessionCatalog for RestSessionCatalog {
 
     fn create_namespace(
         &self,
-        _context: &SessionContext,
+        context: &SessionContext,
         namespace: &NamespaceIdent,
         properties: HashMap<String, String>,
     ) -> Result<Namespace> {
@@ -1003,7 +1016,7 @@ impl SessionCatalog for RestSessionCatalog {
                 }),
         )?;
 
-        let http_response = client.query_catalog(request)?;
+        let http_response = client.query_catalog(context, request)?;
 
         match http_response.status() {
             StatusCode::OK => {
@@ -1024,7 +1037,7 @@ impl SessionCatalog for RestSessionCatalog {
 
     fn get_namespace(
         &self,
-        _context: &SessionContext,
+        context: &SessionContext,
         namespace: &NamespaceIdent,
     ) -> Result<Namespace> {
         let client = self.client()?;
@@ -1035,7 +1048,7 @@ impl SessionCatalog for RestSessionCatalog {
                 .request(Method::GET, client.config.namespace_endpoint(namespace)),
         )?;
 
-        let http_response = client.query_catalog(request)?;
+        let http_response = client.query_catalog(context, request)?;
 
         match http_response.status() {
             StatusCode::OK => {
@@ -1072,7 +1085,11 @@ impl SessionCatalog for RestSessionCatalog {
         }
 
         let client = self.client()?;
-        self.check_exists_via_head(client, client.config.namespace_endpoint(ns))
+        self.check_exists_via_head(
+            context,
+            client,
+            client.config.namespace_endpoint(ns),
+        )
     }
 
     fn update_namespace(
@@ -1089,7 +1106,7 @@ impl SessionCatalog for RestSessionCatalog {
 
     fn drop_namespace(
         &self,
-        _context: &SessionContext,
+        context: &SessionContext,
         namespace: &NamespaceIdent,
     ) -> Result<()> {
         let client = self.client()?;
@@ -1100,7 +1117,7 @@ impl SessionCatalog for RestSessionCatalog {
                 .request(Method::DELETE, client.config.namespace_endpoint(namespace)),
         )?;
 
-        let http_response = client.query_catalog(request)?;
+        let http_response = client.query_catalog(context, request)?;
 
         match http_response.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
@@ -1117,7 +1134,7 @@ impl SessionCatalog for RestSessionCatalog {
 
     fn list_tables(
         &self,
-        _context: &SessionContext,
+        context: &SessionContext,
         namespace: &NamespaceIdent,
     ) -> Result<Vec<TableIdent>> {
         let client = self.client()?;
@@ -1133,7 +1150,8 @@ impl SessionCatalog for RestSessionCatalog {
                 request = request.query(&[("pageToken", token)]);
             }
 
-            let http_response = client.query_catalog(HttpRequest::build(request)?)?;
+            let http_response =
+                client.query_catalog(context, HttpRequest::build(request)?)?;
 
             match http_response.status() {
                 StatusCode::OK => {
@@ -1172,7 +1190,7 @@ impl SessionCatalog for RestSessionCatalog {
     /// table's storage, while scoped credentials override both at route use.
     fn create_table(
         &self,
-        _context: &SessionContext,
+        context: &SessionContext,
         namespace: &NamespaceIdent,
         creation: TableCreation,
     ) -> Result<Table> {
@@ -1195,7 +1213,7 @@ impl SessionCatalog for RestSessionCatalog {
                 }),
         )?;
 
-        let http_response = client.query_catalog(request)?;
+        let http_response = client.query_catalog(context, request)?;
 
         let response = match http_response.status() {
             StatusCode::OK => {
@@ -1257,10 +1275,10 @@ impl SessionCatalog for RestSessionCatalog {
     /// table's storage, while scoped credentials override both at route use.
     fn load_table(
         &self,
-        _context: &SessionContext,
+        context: &SessionContext,
         table_ident: &TableIdent,
     ) -> Result<Table> {
-        let http_response = self.fetch_table(table_ident)?;
+        let http_response = self.fetch_table(context, table_ident)?;
         let client = self.client()?;
         let response = match http_response.status() {
             StatusCode::OK => deserialize_catalog_response(http_response)?,
@@ -1323,14 +1341,14 @@ impl SessionCatalog for RestSessionCatalog {
     /// Check if a table exists in the catalog.
     fn table_exists(
         &self,
-        _context: &SessionContext,
+        context: &SessionContext,
         table: &TableIdent,
     ) -> Result<bool> {
         // Prefer a cheap HEAD when the server advertises it; otherwise use only
         // the GET status, without deserializing metadata or constructing storage.
         if !self.supports_endpoint(&V1_TABLE_EXISTS)? {
             let client = self.client()?;
-            let response = self.fetch_table(table)?;
+            let response = self.fetch_table(context, table)?;
             return match response.status() {
                 StatusCode::NOT_FOUND => Ok(false),
                 status if status.is_success() => Ok(true),
@@ -1342,13 +1360,17 @@ impl SessionCatalog for RestSessionCatalog {
         }
 
         let client = self.client()?;
-        self.check_exists_via_head(client, client.config.table_endpoint(table))
+        self.check_exists_via_head(
+            context,
+            client,
+            client.config.table_endpoint(table),
+        )
     }
 
     /// Rename a table in the catalog.
     fn rename_table(
         &self,
-        _context: &SessionContext,
+        context: &SessionContext,
         src: &TableIdent,
         dest: &TableIdent,
     ) -> Result<()> {
@@ -1364,7 +1386,7 @@ impl SessionCatalog for RestSessionCatalog {
                 }),
         )?;
 
-        let http_response = client.query_catalog(request)?;
+        let http_response = client.query_catalog(context, request)?;
 
         match http_response.status() {
             StatusCode::NO_CONTENT | StatusCode::OK => Ok(()),
@@ -1385,7 +1407,7 @@ impl SessionCatalog for RestSessionCatalog {
 
     fn register_table(
         &self,
-        _context: &SessionContext,
+        context: &SessionContext,
         table_ident: &TableIdent,
         metadata_location: String,
     ) -> Result<Table> {
@@ -1407,7 +1429,7 @@ impl SessionCatalog for RestSessionCatalog {
                 }),
         )?;
 
-        let http_response = client.query_catalog(request)?;
+        let http_response = client.query_catalog(context, request)?;
 
         let response: LoadTableResult = match http_response.status() {
             StatusCode::OK => {
@@ -1488,7 +1510,7 @@ impl SessionCatalog for RestSessionCatalog {
                 }),
         )?;
 
-        let http_response = client.query_catalog(request)?;
+        let http_response = client.query_catalog(context, request)?;
 
         let response: CommitTableResponse = match http_response.status() {
             StatusCode::OK => deserialize_catalog_response(http_response)?,
@@ -1565,9 +1587,13 @@ impl RestSessionCatalog {
         Ok(PreparedRestCommit::new(request, table_count))
     }
 
-    fn send_prepared_commit(&self, commit: PreparedRestCommit) -> Result<()> {
+    fn send_prepared_commit(
+        &self,
+        context: &SessionContext,
+        commit: PreparedRestCommit,
+    ) -> Result<()> {
         let client = self.client()?;
-        let response = client.query_catalog(commit.request)?;
+        let response = client.query_catalog(context, commit.request)?;
         match response.status() {
             status if status.is_success() => Ok(()),
             _ => Err(deserialize_unexpected_commit_error(

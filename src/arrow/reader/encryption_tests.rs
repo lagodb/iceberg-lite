@@ -217,7 +217,9 @@ fn test_read_encrypted_positional_delete_file() {
             encryption_key,
             Some(aad_prefix),
         )))
-        .build();
+        .with_record_count(batch.num_rows() as u64)
+        .build()
+        .unwrap();
     let schema = Arc::new(
         Schema::builder()
             .with_schema_id(1)
@@ -272,7 +274,9 @@ fn test_read_encrypted_equality_delete_file() {
             encryption_key,
             Some(aad_prefix),
         )))
-        .build();
+        .with_record_count(batch.num_rows() as u64)
+        .build()
+        .unwrap();
 
     let batches: Vec<_> = BasicDeleteFileLoader::new(file_io)
         .read_delete_file(&task, iceberg_schema(PrimitiveType::Long))

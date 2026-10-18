@@ -257,7 +257,8 @@ mod tests {
     use crate::expr::{Bind, BoundPredicate, Reference};
     use crate::spec::{
         Datum, FormatVersion, NestedField, PrimitiveType, Schema, SortOrder,
-        TableMetadataBuilder, Transform, Type, UnboundPartitionSpec,
+        TableMetadataBuilder, Transform, Type, UnboundPartitionField,
+        UnboundPartitionSpec,
     };
 
     /// A historical spec whose source column was dropped from the current schema resolves to an
@@ -281,7 +282,14 @@ mod tests {
         // Spec 0 partitions on `part` (id 2).
         let spec = UnboundPartitionSpec::builder()
             .with_spec_id(0)
-            .add_partition_field(2, "part", Transform::Identity)
+            .add_partition_field(
+                UnboundPartitionField::builder()
+                    .source_ids(vec![2])
+                    .name("part")
+                    .transform(Transform::Identity)
+                    .build()
+                    .unwrap(),
+            )
             .unwrap()
             .build();
 

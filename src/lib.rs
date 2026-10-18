@@ -2,6 +2,7 @@ pub mod arrow;
 pub mod avro;
 pub mod catalog;
 pub mod compression;
+pub mod cow_rewrite;
 pub mod encryption;
 pub mod engine;
 pub mod error;
@@ -16,10 +17,11 @@ pub mod spec;
 pub mod table;
 
 pub(crate) mod delete_file_index;
-mod delete_vector;
+pub mod delete_vector;
 pub mod metadata_columns;
 //mod runtime;
-pub mod test_utils;
+#[cfg(test)]
+mod test_utils;
 pub mod transaction;
 pub mod transform;
 pub mod util;

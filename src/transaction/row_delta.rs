@@ -28,7 +28,7 @@ use crate::spec::{
     ManifestEntry, ManifestStatus, SnapshotRef,
 };
 use crate::table::Table;
-use crate::transaction::action::{ActionCommit, TransactionAction};
+use crate::transaction::action::{ActionCommit, StatelessAction};
 use crate::transaction::snapshot_delta::{DeltaPlan, DeltaSnapshotProducer};
 use crate::{Error, ErrorKind, Result};
 
@@ -112,6 +112,7 @@ impl RowDeltaValidation {
 }
 
 /// Transaction action that commits a [`SnapshotDelta`] with row-delta conflict validation.
+#[derive(Clone)]
 pub struct RowDeltaAction {
     delta: Arc<SnapshotDelta>,
     truncate_base: bool,
@@ -182,8 +183,8 @@ impl RowDeltaAction {
     }
 }
 
-impl TransactionAction for RowDeltaAction {
-    fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+impl StatelessAction for RowDeltaAction {
+    fn commit(&self, table: &Table) -> Result<ActionCommit> {
         let plan =
             DeltaPlan::from_delta_with_truncate(&self.delta, self.truncate_base);
         if plan.is_empty() {

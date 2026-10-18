@@ -71,7 +71,7 @@ impl DeleteFileIndex {
         &self,
         data_file: &DataFile,
         seq_num: Option<i64>,
-    ) -> Vec<FileScanTaskDeleteFile> {
+    ) -> Result<Vec<FileScanTaskDeleteFile>> {
         self.inner.get_deletes_for_data_file(data_file, seq_num)
     }
 }
@@ -172,7 +172,7 @@ impl PopulatedDeleteFileIndex {
         &self,
         data_file: &DataFile,
         seq_num: Option<i64>,
-    ) -> Vec<FileScanTaskDeleteFile> {
+    ) -> Result<Vec<FileScanTaskDeleteFile>> {
         let mut results = vec![];
 
         self.global_equality_deletes
@@ -185,7 +185,10 @@ impl PopulatedDeleteFileIndex {
                     })
                     .unwrap_or_else(|| true)
             })
-            .for_each(|delete| results.push(delete.as_ref().into()));
+            .try_for_each(|delete| -> Result<()> {
+                results.push(FileScanTaskDeleteFile::try_from(delete.as_ref())?);
+                Ok(())
+            })?;
 
         if let Some(deletes) = self.eq_deletes_by_partition.get(data_file.partition())
         {
@@ -200,7 +203,10 @@ impl PopulatedDeleteFileIndex {
                         .unwrap_or_else(|| true)
                         && data_file.partition_spec_id == delete.partition_spec_id
                 })
-                .for_each(|delete| results.push(delete.as_ref().into()));
+                .try_for_each(|delete| -> Result<()> {
+                    results.push(FileScanTaskDeleteFile::try_from(delete.as_ref())?);
+                    Ok(())
+                })?;
         }
 
         if let Some(deletion_vector) =
@@ -212,8 +218,10 @@ impl PopulatedDeleteFileIndex {
                 })
                 .unwrap_or(true);
             if applies {
-                results.push(deletion_vector.as_ref().into());
-                return results;
+                results.push(FileScanTaskDeleteFile::try_from(
+                    deletion_vector.as_ref(),
+                )?);
+                return Ok(results);
             }
         }
 
@@ -231,7 +239,10 @@ impl PopulatedDeleteFileIndex {
                         .unwrap_or_else(|| true)
                         && data_file.partition_spec_id == delete.partition_spec_id
                 })
-                .for_each(|delete| results.push(delete.as_ref().into()));
+                .try_for_each(|delete| -> Result<()> {
+                    results.push(FileScanTaskDeleteFile::try_from(delete.as_ref())?);
+                    Ok(())
+                })?;
         }
 
         if let Some(deletes) = self.pos_deletes_by_path.get(data_file.file_path()) {
@@ -245,10 +256,13 @@ impl PopulatedDeleteFileIndex {
                         })
                         .unwrap_or_else(|| true)
                 })
-                .for_each(|delete| results.push(delete.as_ref().into()));
+                .try_for_each(|delete| -> Result<()> {
+                    results.push(FileScanTaskDeleteFile::try_from(delete.as_ref())?);
+                    Ok(())
+                })?;
         }
 
-        results
+        Ok(results)
     }
 }
 
@@ -296,18 +310,21 @@ mod tests {
         let data_file = build_unpartitioned_data_file();
 
         // All deletes apply to sequence 0
-        let delete_files_to_apply_for_seq_0 =
-            delete_file_index.get_deletes_for_data_file(&data_file, Some(0));
+        let delete_files_to_apply_for_seq_0 = delete_file_index
+            .get_deletes_for_data_file(&data_file, Some(0))
+            .unwrap();
         assert_eq!(delete_files_to_apply_for_seq_0.len(), 4);
 
         // All deletes apply to sequence 3
-        let delete_files_to_apply_for_seq_3 =
-            delete_file_index.get_deletes_for_data_file(&data_file, Some(3));
+        let delete_files_to_apply_for_seq_3 = delete_file_index
+            .get_deletes_for_data_file(&data_file, Some(3))
+            .unwrap();
         assert_eq!(delete_files_to_apply_for_seq_3.len(), 4);
 
         // Last 3 deletes apply to sequence 4
-        let delete_files_to_apply_for_seq_4 =
-            delete_file_index.get_deletes_for_data_file(&data_file, Some(4));
+        let delete_files_to_apply_for_seq_4 = delete_file_index
+            .get_deletes_for_data_file(&data_file, Some(4))
+            .unwrap();
         let actual_paths_to_apply_for_seq_4: Vec<String> =
             delete_files_to_apply_for_seq_4
                 .into_iter()
@@ -320,8 +337,9 @@ mod tests {
         );
 
         // Last 3 deletes apply to sequence 5
-        let delete_files_to_apply_for_seq_5 =
-            delete_file_index.get_deletes_for_data_file(&data_file, Some(5));
+        let delete_files_to_apply_for_seq_5 = delete_file_index
+            .get_deletes_for_data_file(&data_file, Some(5))
+            .unwrap();
         let actual_paths_to_apply_for_seq_5: Vec<String> =
             delete_files_to_apply_for_seq_5
                 .into_iter()
@@ -333,8 +351,9 @@ mod tests {
         );
 
         // Only the last position delete applies to sequence 6
-        let delete_files_to_apply_for_seq_6 =
-            delete_file_index.get_deletes_for_data_file(&data_file, Some(6));
+        let delete_files_to_apply_for_seq_6 = delete_file_index
+            .get_deletes_for_data_file(&data_file, Some(6))
+            .unwrap();
         let actual_paths_to_apply_for_seq_6: Vec<String> =
             delete_files_to_apply_for_seq_6
                 .into_iter()
@@ -351,8 +370,9 @@ mod tests {
             1,
         );
 
-        let delete_files_to_apply_for_partitioned_file =
-            delete_file_index.get_deletes_for_data_file(&partitioned_file, Some(0));
+        let delete_files_to_apply_for_partitioned_file = delete_file_index
+            .get_deletes_for_data_file(&partitioned_file, Some(0))
+            .unwrap();
         let actual_paths_to_apply_for_partitioned_file: Vec<String> =
             delete_files_to_apply_for_partitioned_file
                 .into_iter()
@@ -412,18 +432,21 @@ mod tests {
         );
 
         // All deletes apply to sequence 0
-        let delete_files_to_apply_for_seq_0 =
-            delete_file_index.get_deletes_for_data_file(&partitioned_file, Some(0));
+        let delete_files_to_apply_for_seq_0 = delete_file_index
+            .get_deletes_for_data_file(&partitioned_file, Some(0))
+            .unwrap();
         assert_eq!(delete_files_to_apply_for_seq_0.len(), 4);
 
         // All deletes apply to sequence 3
-        let delete_files_to_apply_for_seq_3 =
-            delete_file_index.get_deletes_for_data_file(&partitioned_file, Some(3));
+        let delete_files_to_apply_for_seq_3 = delete_file_index
+            .get_deletes_for_data_file(&partitioned_file, Some(3))
+            .unwrap();
         assert_eq!(delete_files_to_apply_for_seq_3.len(), 4);
 
         // Last 3 deletes apply to sequence 4
-        let delete_files_to_apply_for_seq_4 =
-            delete_file_index.get_deletes_for_data_file(&partitioned_file, Some(4));
+        let delete_files_to_apply_for_seq_4 = delete_file_index
+            .get_deletes_for_data_file(&partitioned_file, Some(4))
+            .unwrap();
         let actual_paths_to_apply_for_seq_4: Vec<String> =
             delete_files_to_apply_for_seq_4
                 .into_iter()
@@ -436,8 +459,9 @@ mod tests {
         );
 
         // Last 3 deletes apply to sequence 5
-        let delete_files_to_apply_for_seq_5 =
-            delete_file_index.get_deletes_for_data_file(&partitioned_file, Some(5));
+        let delete_files_to_apply_for_seq_5 = delete_file_index
+            .get_deletes_for_data_file(&partitioned_file, Some(5))
+            .unwrap();
         let actual_paths_to_apply_for_seq_5: Vec<String> =
             delete_files_to_apply_for_seq_5
                 .into_iter()
@@ -449,8 +473,9 @@ mod tests {
         );
 
         // Only the last position delete applies to sequence 6
-        let delete_files_to_apply_for_seq_6 =
-            delete_file_index.get_deletes_for_data_file(&partitioned_file, Some(6));
+        let delete_files_to_apply_for_seq_6 = delete_file_index
+            .get_deletes_for_data_file(&partitioned_file, Some(6))
+            .unwrap();
         let actual_paths_to_apply_for_seq_6: Vec<String> =
             delete_files_to_apply_for_seq_6
                 .into_iter()
@@ -467,7 +492,8 @@ mod tests {
             1,
         );
         let delete_files_to_apply_for_different_partition = delete_file_index
-            .get_deletes_for_data_file(&partitioned_second_file, Some(0));
+            .get_deletes_for_data_file(&partitioned_second_file, Some(0))
+            .unwrap();
         let actual_paths_to_apply_for_different_partition: Vec<String> =
             delete_files_to_apply_for_different_partition
                 .into_iter()
@@ -479,7 +505,8 @@ mod tests {
         let partitioned_different_spec =
             build_partitioned_data_file(&partition_one, 2);
         let delete_files_to_apply_for_different_spec = delete_file_index
-            .get_deletes_for_data_file(&partitioned_different_spec, Some(0));
+            .get_deletes_for_data_file(&partitioned_different_spec, Some(0))
+            .unwrap();
         let actual_paths_to_apply_for_different_spec: Vec<String> =
             delete_files_to_apply_for_different_spec
                 .into_iter()
@@ -508,12 +535,14 @@ mod tests {
         assert_eq!(
             delete_file_index
                 .get_deletes_for_data_file(&data_file, Some(0))
+                .unwrap()
                 .len(),
             1
         );
         assert!(
             delete_file_index
                 .get_deletes_for_data_file(&unrelated_data_file, Some(0))
+                .unwrap()
                 .is_empty()
         );
     }
@@ -542,12 +571,14 @@ mod tests {
         assert_eq!(
             delete_file_index
                 .get_deletes_for_data_file(&data_file, Some(0))
+                .unwrap()
                 .len(),
             1
         );
         assert!(
             delete_file_index
                 .get_deletes_for_data_file(&unrelated_data_file, Some(0))
+                .unwrap()
                 .is_empty()
         );
     }
@@ -573,6 +604,7 @@ mod tests {
         assert_eq!(
             delete_file_index
                 .get_deletes_for_data_file(&data_file, Some(0))
+                .unwrap()
                 .len(),
             1
         );
@@ -602,12 +634,14 @@ mod tests {
         assert_eq!(
             delete_file_index
                 .get_deletes_for_data_file(&data_file, Some(0))
+                .unwrap()
                 .len(),
             1
         );
         assert_eq!(
             delete_file_index
                 .get_deletes_for_data_file(&unrelated_data_file, Some(0))
+                .unwrap()
                 .len(),
             1
         );

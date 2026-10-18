@@ -20,6 +20,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize, Serializer};
 use typed_builder::TypedBuilder;
 
+use crate::error::invalid_data;
 use crate::expr::BoundPredicate;
 use crate::spec::{
     DataContentType, DataFile, DataFileFormat, ManifestEntryRef, NameMapping,
@@ -65,10 +66,6 @@ where
     Err(serde::de::Error::custom(
         "Deserialization not implemented for this field",
     ))
-}
-
-fn default_delete_file_format() -> DataFileFormat {
-    DataFileFormat::Parquet
 }
 
 /// A task to scan part of file.
@@ -304,15 +301,17 @@ pub(crate) struct DeleteFileContext {
     pub(crate) partition_spec_id: i32,
 }
 
-impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
-    fn from(ctx: &DeleteFileContext) -> Self {
+impl TryFrom<&DeleteFileContext> for FileScanTaskDeleteFile {
+    type Error = Error;
+
+    fn try_from(ctx: &DeleteFileContext) -> Result<Self> {
         let data_file = &ctx.manifest_entry.data_file;
         let referenced_data_file = if data_file.is_deletion_vector() {
             data_file.referenced_data_file_path()
         } else {
             data_file.position_delete_target_data_file_path()
         };
-        FileScanTaskDeleteFile {
+        let task = FileScanTaskDeleteFile {
             file_path: ctx.manifest_entry.file_path().to_string(),
             file_size_in_bytes: ctx.manifest_entry.file_size_in_bytes(),
             file_type: ctx.manifest_entry.content_type(),
@@ -324,45 +323,52 @@ impl From<&DeleteFileContext> for FileScanTaskDeleteFile {
             content_offset: data_file.content_offset(),
             content_size_in_bytes: data_file.content_size_in_bytes(),
             record_count: data_file.record_count(),
-        }
+        };
+        task.validate()?;
+        Ok(task)
     }
+}
+
+fn default_delete_file_format() -> DataFileFormat {
+    DataFileFormat::Parquet
 }
 
 /// A task to scan part of file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, TypedBuilder)]
-#[builder(field_defaults(setter(prefix = "with_")))]
+#[serde(try_from = "DeleteFileTaskSerde")]
+#[builder(field_defaults(setter(prefix = "with_")), build_method(into = Result<FileScanTaskDeleteFile>))]
 pub struct FileScanTaskDeleteFile {
     /// The delete file path
-    pub file_path: String,
+    pub(crate) file_path: String,
 
     /// The total size of the delete file in bytes, from the manifest entry.
-    pub file_size_in_bytes: u64,
+    pub(crate) file_size_in_bytes: u64,
 
     /// delete file type
-    pub file_type: DataContentType,
+    pub(crate) file_type: DataContentType,
 
     /// delete file format
     #[serde(default = "default_delete_file_format")]
     #[builder(default = DataFileFormat::Parquet)]
-    pub file_format: DataFileFormat,
+    pub(crate) file_format: DataFileFormat,
 
     /// partition id
-    pub partition_spec_id: i32,
+    pub(crate) partition_spec_id: i32,
 
     /// equality ids for equality deletes (null for anything other than equality-deletes)
     #[serde(default)]
     #[builder(default)]
-    pub equality_ids: Option<Vec<i32>>,
+    pub(crate) equality_ids: Option<Vec<i32>>,
 
     /// Key metadata for encrypted delete files (Parquet Modular Encryption).
     /// When present, the reader uses this to build `FileDecryptionProperties`.
     ///
-    /// Same plaintext-DEK trust boundary as [`FileScanTask::key_metadata`]:
+    /// Same plaintext-DEK trust boundary as [`FileScanTask::key_metadata`](super::FileScanTask::key_metadata):
     /// this is part of the serialized scan plan should these tasks be serialized.
     #[serde(default)]
     #[serde(skip_serializing_if = "Option::is_none")]
     #[builder(default)]
-    pub key_metadata: Option<Box<[u8]>>,
+    pub(crate) key_metadata: Option<Box<[u8]>>,
 
     /// Effective data file path referenced by file-scoped position deletes or
     /// deletion vectors.
@@ -372,22 +378,20 @@ pub struct FileScanTaskDeleteFile {
     /// from the manifest's explicit `referenced_data_file` field.
     #[serde(default)]
     #[builder(default)]
-    pub referenced_data_file: Option<String>,
+    pub(crate) referenced_data_file: Option<String>,
 
     /// Offset of a referenced Puffin blob for deletion vectors.
     #[serde(default)]
     #[builder(default)]
-    pub content_offset: Option<i64>,
+    pub(crate) content_offset: Option<i64>,
 
     /// Size of a referenced Puffin blob for deletion vectors.
     #[serde(default)]
     #[builder(default)]
-    pub content_size_in_bytes: Option<i64>,
+    pub(crate) content_size_in_bytes: Option<i64>,
 
     /// Delete record count, or deletion-vector cardinality for Puffin DVs.
-    #[serde(default)]
-    #[builder(default)]
-    pub record_count: u64,
+    pub(crate) record_count: u64,
 }
 
 impl FileScanTaskDeleteFile {
@@ -424,8 +428,145 @@ impl FileScanTaskDeleteFile {
     }
 }
 
+#[derive(Deserialize)]
+struct DeleteFileTaskSerde {
+    file_path: String,
+    file_size_in_bytes: u64,
+    file_type: DataContentType,
+    #[serde(default = "default_delete_file_format")]
+    file_format: DataFileFormat,
+    partition_spec_id: i32,
+    equality_ids: Option<Vec<i32>>,
+    key_metadata: Option<Box<[u8]>>,
+    referenced_data_file: Option<String>,
+    content_offset: Option<i64>,
+    content_size_in_bytes: Option<i64>,
+    record_count: u64,
+}
+
+impl TryFrom<DeleteFileTaskSerde> for FileScanTaskDeleteFile {
+    type Error = Error;
+
+    fn try_from(value: DeleteFileTaskSerde) -> Result<Self> {
+        let task = Self {
+            file_path: value.file_path,
+            file_size_in_bytes: value.file_size_in_bytes,
+            file_type: value.file_type,
+            file_format: value.file_format,
+            partition_spec_id: value.partition_spec_id,
+            equality_ids: value.equality_ids,
+            key_metadata: value.key_metadata,
+            referenced_data_file: value.referenced_data_file,
+            content_offset: value.content_offset,
+            content_size_in_bytes: value.content_size_in_bytes,
+            record_count: value.record_count,
+        };
+        task.validate()?;
+        Ok(task)
+    }
+}
+
+impl From<FileScanTaskDeleteFile> for Result<FileScanTaskDeleteFile> {
+    fn from(task: FileScanTaskDeleteFile) -> Self {
+        task.validate()?;
+        Ok(task)
+    }
+}
+
+impl FileScanTaskDeleteFile {
+    /// Returns the delete file's file path.
+    pub fn file_path(&self) -> &str {
+        &self.file_path
+    }
+
+    /// Returns the delete file's file size in bytes.
+    pub fn file_size_in_bytes(&self) -> u64 {
+        self.file_size_in_bytes
+    }
+
+    /// Returns the delete file's file type.
+    pub fn file_type(&self) -> DataContentType {
+        self.file_type
+    }
+
+    /// Returns the delete file's file format.
+    pub fn file_format(&self) -> DataFileFormat {
+        self.file_format
+    }
+
+    /// Returns the delete file's partition spec id.
+    pub fn partition_spec_id(&self) -> i32 {
+        self.partition_spec_id
+    }
+
+    /// Returns the delete file's equality ids.
+    pub fn equality_ids(&self) -> Option<&[i32]> {
+        self.equality_ids.as_deref()
+    }
+
+    /// Returns the delete file's key metadata.
+    pub fn key_metadata(&self) -> Option<&[u8]> {
+        self.key_metadata.as_deref()
+    }
+
+    /// Returns the delete file's content offset.
+    pub fn content_offset(&self) -> Option<i64> {
+        self.content_offset
+    }
+
+    /// Returns the delete file's content size in bytes.
+    pub fn content_size_in_bytes(&self) -> Option<i64> {
+        self.content_size_in_bytes
+    }
+
+    /// Returns the delete file's record count.
+    pub fn record_count(&self) -> u64 {
+        self.record_count
+    }
+
+    pub(super) fn validate(&self) -> Result<()> {
+        for (name, value) in [
+            ("content_offset", self.content_offset),
+            ("content_size_in_bytes", self.content_size_in_bytes),
+        ] {
+            if value.is_some_and(|value| value < 0) {
+                return Err(invalid_data!(
+                    "delete file {} has negative {name}",
+                    self.file_path
+                ));
+            }
+        }
+        if self.content_offset.is_some() && self.content_size_in_bytes.is_none() {
+            return Err(invalid_data!(
+                "delete file {} is missing content_size_in_bytes while content_offset is present",
+                self.file_path
+            ));
+        }
+        if self.is_deletion_vector() {
+            let missing = if self.referenced_data_file.is_none() {
+                Some("referenced_data_file")
+            } else if self.content_offset.is_none() {
+                Some("content_offset")
+            } else if self.content_size_in_bytes.is_none() {
+                Some("content_size_in_bytes")
+            } else {
+                None
+            };
+            if let Some(field) = missing {
+                return Err(invalid_data!(
+                    "deletion vector {} is missing {field}",
+                    self.file_path
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
     use crate::spec::{Literal, NestedField, PrimitiveType, Transform, Type};
 
@@ -494,5 +635,61 @@ mod tests {
         .validate()
         .unwrap_err();
         assert_eq!(error.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[test]
+    fn serde_rejects_incomplete_or_negative_dv_coordinates() {
+        // Use the type's serialized representation, including enum spelling.
+        let task = FileScanTaskDeleteFile::builder()
+            .with_file_path("dv.puffin".into())
+            .with_file_size_in_bytes(100)
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_file_format(DataFileFormat::Puffin)
+            .with_partition_spec_id(0)
+            .with_referenced_data_file(Some("data.parquet".into()))
+            .with_content_offset(Some(4))
+            .with_content_size_in_bytes(Some(34))
+            .with_record_count(3)
+            .build()
+            .unwrap();
+        let valid = serde_json::to_value(&task).unwrap();
+        assert_eq!(
+            serde_json::from_value::<FileScanTaskDeleteFile>(valid.clone()).unwrap(),
+            task
+        );
+        for field in [
+            "referenced_data_file",
+            "content_offset",
+            "content_size_in_bytes",
+            "record_count",
+        ] {
+            let mut incomplete = valid.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(
+                serde_json::from_value::<FileScanTaskDeleteFile>(incomplete).is_err(),
+                "{field}"
+            );
+        }
+        for field in ["content_offset", "content_size_in_bytes"] {
+            let mut negative = valid.clone();
+            negative[field] = json!(-1);
+            assert!(
+                serde_json::from_value::<FileScanTaskDeleteFile>(negative).is_err(),
+                "{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn builder_rejects_offset_without_size() {
+        let result = FileScanTaskDeleteFile::builder()
+            .with_file_path("delete.parquet".into())
+            .with_file_size_in_bytes(100)
+            .with_file_type(DataContentType::PositionDeletes)
+            .with_partition_spec_id(0)
+            .with_content_offset(Some(4))
+            .with_record_count(3)
+            .build();
+        assert!(result.is_err());
     }
 }

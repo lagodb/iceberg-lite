@@ -20,8 +20,8 @@ use arrow_array::RecordBatch;
 use crate::Result;
 use crate::arrow::SelectedRowsReadRequest;
 use crate::expr::Reference;
-use crate::scan::tests::TableTestFixture;
 use crate::spec::Datum;
+use crate::test_utils::scan::TableTestFixture;
 
 #[test]
 fn empty_projection_preserves_rows_selected_by_filter() {

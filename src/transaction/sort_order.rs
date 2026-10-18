@@ -15,14 +15,12 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use std::sync::Arc;
-
 use crate::error::Result;
 use crate::spec::{
     NullOrder, SchemaRef, SortDirection, SortField, SortOrder, Transform,
 };
 use crate::table::Table;
-use crate::transaction::{ActionCommit, TransactionAction};
+use crate::transaction::{ActionCommit, StatelessAction};
 use crate::{Error, ErrorKind, TableRequirement, TableUpdate};
 
 /// Represents a sort field whose construction and validation are deferred until commit time.
@@ -63,6 +61,7 @@ impl PendingSortField {
 }
 
 /// Transaction action for replacing sort order.
+#[derive(Clone)]
 pub struct ReplaceSortOrderAction {
     pending_sort_fields: Vec<PendingSortField>,
 }
@@ -128,8 +127,8 @@ impl Default for ReplaceSortOrderAction {
     }
 }
 
-impl TransactionAction for ReplaceSortOrderAction {
-    fn commit(self: Arc<Self>, table: &Table) -> Result<ActionCommit> {
+impl StatelessAction for ReplaceSortOrderAction {
+    fn commit(&self, table: &Table) -> Result<ActionCommit> {
         let current_schema = table.metadata().current_schema();
         let sort_fields: Result<Vec<SortField>> = self
             .pending_sort_fields
@@ -166,6 +165,7 @@ mod tests {
     use as_any::Downcast;
 
     use crate::spec::{NullOrder, SortDirection, Transform};
+    use crate::transaction::action::ActionEntry;
     use crate::transaction::sort_order::{PendingSortField, ReplaceSortOrderAction};
     use crate::transaction::tests::make_v2_table;
     use crate::transaction::{ApplyTransactionAction, Transaction};
@@ -183,8 +183,9 @@ mod tests {
             .unwrap();
 
         let replace_sort_order = (*tx.actions[0])
-            .downcast_ref::<ReplaceSortOrderAction>()
-            .unwrap();
+            .downcast_ref::<ActionEntry<ReplaceSortOrderAction>>()
+            .unwrap()
+            .action();
 
         assert_eq!(
             replace_sort_order.pending_sort_fields,
@@ -217,8 +218,9 @@ mod tests {
             .unwrap();
 
         let action = (*tx.actions[0])
-            .downcast_ref::<ReplaceSortOrderAction>()
-            .unwrap();
+            .downcast_ref::<ActionEntry<ReplaceSortOrderAction>>()
+            .unwrap()
+            .action();
         assert_eq!(
             action.pending_sort_fields[0].transform,
             Transform::Bucket(16)

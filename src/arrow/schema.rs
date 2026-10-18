@@ -26,7 +26,7 @@ use arrow_array::{
     FixedSizeBinaryArray, Float32Array, Float64Array, Int32Array, Int64Array, Scalar,
     StringArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
-use arrow_schema::extension::ExtensionType;
+use arrow_schema::extension::{ExtensionType, Uuid as UuidExtensionType};
 use arrow_schema::{
     ArrowError, DataType, Field, FieldRef, Fields, Schema as ArrowSchema, TimeUnit,
 };
@@ -34,12 +34,12 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::statistics::Statistics;
 use uuid::Uuid;
 
-use crate::error::Result;
+use crate::error::{Result, invalid_data};
 use crate::spec::decimal_utils::i128_from_be_bytes;
 use crate::spec::{
-    Datum, FIRST_FIELD_ID, ListType, MapType, NestedField, NestedFieldRef,
-    PrimitiveLiteral, PrimitiveType, Schema, SchemaVisitor, StructType, Type,
-    VariantType,
+    Datum, FIRST_FIELD_ID, LIST_FIELD_NAME, ListType, MAP_KEY_FIELD_NAME,
+    MAP_VALUE_FIELD_NAME, MapType, NestedField, NestedFieldRef, PrimitiveLiteral,
+    PrimitiveType, Schema, SchemaVisitor, StructType, Type, VariantType,
 };
 use crate::{Error, ErrorKind};
 
@@ -106,7 +106,7 @@ impl ExtensionType for VariantExtensionType {
 
 /// A post order arrow schema visitor.
 ///
-/// For order of methods called, please refer to [`visit_schema`].
+/// For order of methods called, please refer to the internal `visit_schema` function.
 pub trait ArrowSchemaVisitor {
     /// Return type of this visitor on arrow field.
     type T;
@@ -114,12 +114,16 @@ pub trait ArrowSchemaVisitor {
     /// Return type of this visitor on arrow schema.
     type U;
 
-    /// Called before struct/list/map field.
+    /// Called before each field of the schema or of a struct, whatever its type.
+    /// List elements and map keys and values use [`Self::before_list_element`],
+    /// [`Self::before_map_key`] and [`Self::before_map_value`] instead.
     fn before_field(&mut self, _field: &FieldRef) -> Result<()> {
         Ok(())
     }
 
-    /// Called after struct/list/map field.
+    /// Called after each field of the schema or of a struct, whatever its type.
+    /// List elements and map keys and values use [`Self::after_list_element`],
+    /// [`Self::after_map_key`] and [`Self::after_map_value`] instead.
     fn after_field(&mut self, _field: &FieldRef) -> Result<()> {
         Ok(())
     }
@@ -179,8 +183,33 @@ pub trait ArrowSchemaVisitor {
     /// Called when see a primitive type.
     fn primitive(&mut self, p: &DataType) -> Result<Self::T>;
 
-    /// Called when a field carries the canonical Parquet Variant extension type.
+    /// Called when a field carries the `arrow.parquet.variant` extension type.
+    ///
+    /// The default treats the variant as its underlying Arrow struct storage: it
+    /// re-enters normal traversal, preserving the behavior of visitors that don't
+    /// special-case variants. A visitor that produces Iceberg types (or otherwise
+    /// needs variant identity) should override this to fold the struct into a
+    /// single logical variant.
+    ///
+    /// Takes the `&FieldRef` rather than a `&DataType` because the variant signal
+    /// lives on the field's metadata, not on its data type.
     fn variant(&mut self, field: &FieldRef) -> Result<Self::T>
+    where
+        Self: Sized,
+    {
+        visit_type(field.data_type(), self)
+    }
+
+    /// Called when a field carries the `arrow.uuid` extension type.
+    ///
+    /// The default treats the field as its underlying Arrow storage, preserving
+    /// the behavior of visitors that don't special-case UUIDs. A visitor that
+    /// produces Iceberg types should override this to fold the storage into a
+    /// single logical UUID.
+    ///
+    /// Takes the `&FieldRef` rather than a `&DataType` because the UUID signal
+    /// lives on the field's metadata, not on its data type.
+    fn uuid(&mut self, field: &FieldRef) -> Result<Self::T>
     where
         Self: Sized,
     {
@@ -220,9 +249,8 @@ fn visit_type<V: ArrowSchemaVisitor>(
         DataType::Map(field, _) => match field.data_type() {
             DataType::Struct(fields) => {
                 if fields.len() != 2 {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        "Map field must have exactly 2 fields",
+                    return Err(invalid_data!(
+                        "Map field must have exactly 2 fields"
                     ));
                 }
 
@@ -245,28 +273,28 @@ fn visit_type<V: ArrowSchemaVisitor>(
 
                 visitor.map(r#type, key_result, value_result)
             }
-            _ => Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Map field must have struct type",
-            )),
+            _ => Err(invalid_data!("Map field must have struct type")),
         },
         DataType::Struct(fields) => visit_struct(fields, visitor),
         DataType::Dictionary(_key_type, value_type) => {
             visit_type(value_type, visitor)
         }
-        other => Err(Error::new(
-            ErrorKind::DataInvalid,
-            format!("Cannot visit Arrow data type: {other}"),
-        )),
+        other => Err(invalid_data!("Cannot visit Arrow data type: {other}")),
     }
 }
 
+/// Dispatch a field, and fold it into following extension types when carried:
+///  - `arrow.parquet.variant` -- fold into a variant,
+///  - `arrow.uuid` -- fold it into a UUID type,
+///  - and in all other cases we visit it's data.
 fn visit_field<V: ArrowSchemaVisitor>(
     field: &FieldRef,
     visitor: &mut V,
 ) -> Result<V::T> {
     if field.extension_type_name() == Some(VariantExtensionType::NAME) {
         visitor.variant(field)
+    } else if field.extension_type_name() == Some(UuidExtensionType::NAME) {
+        visitor.uuid(field)
     } else {
         visit_type(field.data_type(), visitor)
     }
@@ -327,8 +355,12 @@ pub fn arrow_schema_to_schema(schema: &ArrowSchema) -> Result<Schema> {
 
 /// Convert Arrow schema to Iceberg schema with automatically assigned field IDs.
 ///
-/// Unlike [`arrow_schema_to_schema`], this function does not require field IDs in
-/// Arrow field metadata. It assigns unique field IDs starting from 1.
+/// Unlike [`arrow_schema_to_schema`], this function does not require field IDs in the Arrow
+/// schema metadata. Instead, it automatically assigns unique field IDs starting from 1,
+/// following Iceberg's field ID assignment rules.
+///
+/// This is useful when converting Arrow schemas that don't originate from Iceberg tables,
+/// such as schemas from DataFusion or other Arrow-based systems.
 pub fn arrow_schema_to_schema_auto_assign_ids(
     schema: &ArrowSchema,
 ) -> Result<Schema> {
@@ -344,21 +376,23 @@ pub fn arrow_type_to_type(ty: &DataType) -> Result<Type> {
 
 const ARROW_FIELD_DOC_KEY: &str = "doc";
 
+pub(super) fn try_get_field_id_from_metadata(field: &Field) -> Result<Option<i32>> {
+    field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .map(|value| {
+            value.parse::<i32>().map_err(|e| {
+                invalid_data!("Failed to parse field id")
+                    .with_context("value", value)
+                    .with_source(e)
+            })
+        })
+        .transpose()
+}
+
 pub(super) fn get_field_id_from_metadata(field: &FieldRef) -> Result<i32> {
-    if let Some(value) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) {
-        return value.parse::<i32>().map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                "Failed to parse field id".to_string(),
-            )
-            .with_context("value", value)
-            .with_source(e)
-        });
-    }
-    Err(Error::new(
-        ErrorKind::DataInvalid,
-        "Field id not found in metadata",
-    ))
+    try_get_field_id_from_metadata(field)?
+        .ok_or_else(|| invalid_data!("Field id not found in metadata"))
 }
 
 fn get_field_doc(field: &FieldRef) -> Option<String> {
@@ -369,7 +403,12 @@ fn get_field_doc(field: &FieldRef) -> Option<String> {
 }
 
 struct ArrowSchemaConverter {
+    /// When set, the schema builder will reassign field IDs starting from this value
+    /// using level-order traversal (breadth-first).
     reassign_field_ids_from: Option<i32>,
+    /// Generates unique placeholder IDs for fields before reassignment.
+    /// Required because `ReassignFieldIds` builds an old-to-new ID mapping
+    /// that expects unique input IDs.
     next_field_id: i32,
 }
 
@@ -390,10 +429,14 @@ impl ArrowSchemaConverter {
 
     fn get_field_id(&mut self, field: &FieldRef) -> Result<i32> {
         if self.reassign_field_ids_from.is_some() {
+            // Field IDs will be reassigned by the schema builder.
+            // We need unique temporary IDs because ReassignFieldIds builds an
+            // old->new ID mapping that requires unique input IDs.
             let temp_id = self.next_field_id;
             self.next_field_id += 1;
             Ok(temp_id)
         } else {
+            // Get field ID from arrow field metadata
             get_field_id_from_metadata(field)
         }
     }
@@ -436,7 +479,7 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
         let fields = self.convert_fields(schema.fields(), &values)?;
         let mut builder = Schema::builder().with_fields(fields);
         if let Some(start_from) = self.reassign_field_ids_from {
-            builder = builder.with_reassigned_field_ids(start_from);
+            builder = builder.with_reassigned_field_ids(start_from)
         }
         builder.build()
     }
@@ -456,10 +499,7 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
             DataType::LargeList(element_field) => element_field,
             DataType::FixedSizeList(element_field, _) => element_field,
             _ => {
-                return Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "List type must have list data type",
-                ));
+                return Err(invalid_data!("List type must have list data type"));
             }
         };
 
@@ -487,9 +527,8 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
             DataType::Map(field, _) => match field.data_type() {
                 DataType::Struct(fields) => {
                     if fields.len() != 2 {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            "Map field must have exactly 2 fields",
+                        return Err(invalid_data!(
+                            "Map field must have exactly 2 fields"
                         ));
                     }
 
@@ -522,15 +561,9 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
                         value_field,
                     }))
                 }
-                _ => Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "Map field must have struct type",
-                )),
+                _ => Err(invalid_data!("Map field must have struct type")),
             },
-            _ => Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Map type must have map data type",
-            )),
+            _ => Err(invalid_data!("Map type must have map data type")),
         }
     }
 
@@ -548,20 +581,15 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
             DataType::Int64 => Ok(Type::Primitive(PrimitiveType::Long)),
             DataType::UInt64 => {
                 // Block uint64 - no safe casting option
-                Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "UInt64 is not supported. Use Int64 for values ≤ 9,223,372,036,854,775,807 or Decimal(20,0) for full uint64 range.",
+                Err(invalid_data!(
+                    "UInt64 is not supported. Use Int64 for values ≤ 9,223,372,036,854,775,807 or Decimal(20,0) for full uint64 range."
                 ))
             }
             DataType::Float32 => Ok(Type::Primitive(PrimitiveType::Float)),
             DataType::Float64 => Ok(Type::Primitive(PrimitiveType::Double)),
             DataType::Decimal128(p, s) => Type::decimal(*p as u32, *s as u32)
                 .map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        "Failed to create decimal type".to_string(),
-                    )
-                    .with_source(e)
+                    invalid_data!("Failed to create decimal type").with_source(e)
                 }),
             DataType::Date32 => Ok(Type::Primitive(PrimitiveType::Date)),
             DataType::Time64(unit) if unit == &TimeUnit::Microsecond => {
@@ -594,22 +622,39 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
             DataType::Utf8View | DataType::Utf8 | DataType::LargeUtf8 => {
                 Ok(Type::Primitive(PrimitiveType::String))
             }
-            _ => Err(Error::new(
-                ErrorKind::DataInvalid,
-                format!("Unsupported Arrow data type: {p}"),
-            )),
+            _ => Err(invalid_data!("Unsupported Arrow data type: {p}")),
         }
     }
 
     fn variant(&mut self, field: &FieldRef) -> Result<Self::T> {
+        // The extension may only sit on struct storage (mirrors
+        // `VariantExtensionType::supports_data_type`).
         if !matches!(field.data_type(), DataType::Struct(_)) {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "arrow.parquet.variant extension requires Struct storage",
+            return Err(invalid_data!(
+                "arrow.parquet.variant extension requires Struct storage"
             ));
         }
-
+        // Fold the whole struct into a single logical variant without descending:
+        // the storage sub-fields carry no Iceberg field id, so visiting them would
+        // fail. The enclosing field's own id is read by the caller.
         Ok(Type::Variant(VariantType))
+    }
+
+    fn uuid(&mut self, field: &FieldRef) -> Result<Self::T> {
+        // The extension expects a fixed size binary.
+        // See: Apache Arrow spec https://arrow.apache.org/docs/format/CanonicalExtensions.html#uuid
+        let field_data_type = field.data_type();
+        let expected_data_type = DataType::FixedSizeBinary(16);
+        if *field_data_type != expected_data_type {
+            let error_message = format!(
+                "{} extension requires {expected_data_type} storage, found {field_data_type}",
+                UuidExtensionType::NAME,
+            );
+
+            return Err(Error::new(ErrorKind::DataInvalid, error_message));
+        }
+
+        Ok(Type::Primitive(PrimitiveType::Uuid))
     }
 }
 
@@ -626,9 +671,9 @@ impl SchemaVisitor for ToArrowSchemaConverter {
 
     fn schema(
         &mut self,
-        _schema: &crate::spec::Schema,
+        _schema: &Schema,
         value: ArrowSchemaOrFieldOrType,
-    ) -> crate::Result<ArrowSchemaOrFieldOrType> {
+    ) -> Result<ArrowSchemaOrFieldOrType> {
         let struct_type = match value {
             ArrowSchemaOrFieldOrType::Type(DataType::Struct(fields)) => fields,
             _ => unreachable!(),
@@ -640,9 +685,9 @@ impl SchemaVisitor for ToArrowSchemaConverter {
 
     fn field(
         &mut self,
-        field: &crate::spec::NestedFieldRef,
+        field: &NestedFieldRef,
         value: ArrowSchemaOrFieldOrType,
-    ) -> crate::Result<ArrowSchemaOrFieldOrType> {
+    ) -> Result<ArrowSchemaOrFieldOrType> {
         let ty = match value {
             ArrowSchemaOrFieldOrType::Type(ty) => ty,
             _ => unreachable!(),
@@ -660,19 +705,29 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         };
         let arrow_field = Field::new(field.name.clone(), ty, !field.required)
             .with_metadata(metadata);
+        // A variant column's storage is a struct; tag the field with the canonical
+        // `arrow.parquet.variant` extension type so consumers read it as a Variant, not a struct.
         let arrow_field = if field.field_type.is_variant() {
             arrow_field.with_extension_type(VariantExtensionType)
+        } else if matches!(
+            field.field_type.as_ref(),
+            Type::Primitive(PrimitiveType::Uuid)
+        ) {
+            // A uuid column's storage is FixedSizeBinary(16); tag the field with the canonical
+            // `arrow.uuid` extension type so consumers read it as a UUID, not opaque bytes.
+            arrow_field.with_extension_type(UuidExtensionType)
         } else {
             arrow_field
         };
+
         Ok(ArrowSchemaOrFieldOrType::Field(arrow_field))
     }
 
     fn r#struct(
         &mut self,
-        _: &crate::spec::StructType,
+        _: &StructType,
         results: Vec<ArrowSchemaOrFieldOrType>,
-    ) -> crate::Result<ArrowSchemaOrFieldOrType> {
+    ) -> Result<ArrowSchemaOrFieldOrType> {
         let fields = results
             .into_iter()
             .map(|result| match result {
@@ -685,9 +740,9 @@ impl SchemaVisitor for ToArrowSchemaConverter {
 
     fn list(
         &mut self,
-        list: &crate::spec::ListType,
+        list: &ListType,
         value: ArrowSchemaOrFieldOrType,
-    ) -> crate::Result<Self::T> {
+    ) -> Result<Self::T> {
         // `field` already carries the element's field id, doc, and — for a variant element —
         // the arrow.parquet.variant extension type. Don't overwrite its metadata here (doing so
         // would drop the extension type for `list<variant>`).
@@ -702,10 +757,10 @@ impl SchemaVisitor for ToArrowSchemaConverter {
 
     fn map(
         &mut self,
-        map: &crate::spec::MapType,
+        map: &MapType,
         key_value: ArrowSchemaOrFieldOrType,
         value: ArrowSchemaOrFieldOrType,
-    ) -> crate::Result<ArrowSchemaOrFieldOrType> {
+    ) -> Result<ArrowSchemaOrFieldOrType> {
         let key_field = match self.field(&map.key_field, key_value)? {
             ArrowSchemaOrFieldOrType::Field(field) => field,
             _ => unreachable!(),
@@ -727,45 +782,36 @@ impl SchemaVisitor for ToArrowSchemaConverter {
         )))
     }
 
-    fn primitive(
-        &mut self,
-        p: &crate::spec::PrimitiveType,
-    ) -> crate::Result<ArrowSchemaOrFieldOrType> {
+    fn primitive(&mut self, p: &PrimitiveType) -> Result<ArrowSchemaOrFieldOrType> {
         match p {
-            crate::spec::PrimitiveType::Unknown => {
+            PrimitiveType::Unknown => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::Null))
             }
-            crate::spec::PrimitiveType::Boolean => {
+            PrimitiveType::Boolean => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::Boolean))
             }
-            crate::spec::PrimitiveType::Int => {
-                Ok(ArrowSchemaOrFieldOrType::Type(DataType::Int32))
-            }
-            crate::spec::PrimitiveType::Long => {
+            PrimitiveType::Int => Ok(ArrowSchemaOrFieldOrType::Type(DataType::Int32)),
+            PrimitiveType::Long => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::Int64))
             }
-            crate::spec::PrimitiveType::Float => {
+            PrimitiveType::Float => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::Float32))
             }
-            crate::spec::PrimitiveType::Double => {
+            PrimitiveType::Double => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::Float64))
             }
-            crate::spec::PrimitiveType::Decimal { precision, scale } => {
+            PrimitiveType::Decimal { precision, scale } => {
                 let (precision, scale) = {
                     let precision: u8 =
                         precision.to_owned().try_into().map_err(|err| {
-                            Error::new(
-                                crate::ErrorKind::DataInvalid,
-                                "incompatible precision for decimal type convert",
+                            invalid_data!(
+                                "incompatible precision for decimal type convert"
                             )
                             .with_source(err)
                         })?;
                     let scale = scale.to_owned().try_into().map_err(|err| {
-                        Error::new(
-                            crate::ErrorKind::DataInvalid,
-                            "incompatible scale for decimal type convert",
-                        )
-                        .with_source(err)
+                        invalid_data!("incompatible scale for decimal type convert")
+                            .with_source(err)
                     })?;
                     (precision, scale)
                 };
@@ -773,9 +819,8 @@ impl SchemaVisitor for ToArrowSchemaConverter {
                     precision, scale,
                 )
                 .map_err(|err| {
-                    Error::new(
-                        crate::ErrorKind::DataInvalid,
-                        "incompatible precision and scale for decimal type convert",
+                    invalid_data!(
+                        "incompatible precision and scale for decimal type convert"
                     )
                     .with_source(err)
                 })?;
@@ -783,57 +828,42 @@ impl SchemaVisitor for ToArrowSchemaConverter {
                     precision, scale,
                 )))
             }
-            crate::spec::PrimitiveType::Date => {
+            PrimitiveType::Date => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::Date32))
             }
-            crate::spec::PrimitiveType::Time => Ok(ArrowSchemaOrFieldOrType::Type(
+            PrimitiveType::Time => Ok(ArrowSchemaOrFieldOrType::Type(
                 DataType::Time64(TimeUnit::Microsecond),
             )),
-            crate::spec::PrimitiveType::Timestamp => {
-                Ok(ArrowSchemaOrFieldOrType::Type(DataType::Timestamp(
+            PrimitiveType::Timestamp => Ok(ArrowSchemaOrFieldOrType::Type(
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            )),
+            PrimitiveType::Timestamptz => Ok(ArrowSchemaOrFieldOrType::Type(
+                // Timestampz always stored as UTC
+                DataType::Timestamp(
                     TimeUnit::Microsecond,
-                    None,
-                )))
-            }
-            crate::spec::PrimitiveType::Timestamptz => {
-                Ok(ArrowSchemaOrFieldOrType::Type(
-                    // Timestampz always stored as UTC
-                    DataType::Timestamp(
-                        TimeUnit::Microsecond,
-                        Some(UTC_TIME_ZONE.into()),
-                    ),
-                ))
-            }
-            crate::spec::PrimitiveType::TimestampNs => {
-                Ok(ArrowSchemaOrFieldOrType::Type(DataType::Timestamp(
-                    TimeUnit::Nanosecond,
-                    None,
-                )))
-            }
-            crate::spec::PrimitiveType::TimestamptzNs => {
-                Ok(ArrowSchemaOrFieldOrType::Type(
-                    // Store timestamptz_ns as UTC
-                    DataType::Timestamp(
-                        TimeUnit::Nanosecond,
-                        Some(UTC_TIME_ZONE.into()),
-                    ),
-                ))
-            }
-            crate::spec::PrimitiveType::String => {
+                    Some(UTC_TIME_ZONE.into()),
+                ),
+            )),
+            PrimitiveType::TimestampNs => Ok(ArrowSchemaOrFieldOrType::Type(
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            )),
+            PrimitiveType::TimestamptzNs => Ok(ArrowSchemaOrFieldOrType::Type(
+                // Store timestamptz_ns as UTC
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
+            )),
+            PrimitiveType::String => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::Utf8))
             }
-            crate::spec::PrimitiveType::Uuid => Ok(ArrowSchemaOrFieldOrType::Type(
+            PrimitiveType::Uuid => Ok(ArrowSchemaOrFieldOrType::Type(
                 DataType::FixedSizeBinary(16),
             )),
-            crate::spec::PrimitiveType::Fixed(len) => {
-                Ok(ArrowSchemaOrFieldOrType::Type(
-                    i32::try_from(*len)
-                        .ok()
-                        .map(DataType::FixedSizeBinary)
-                        .unwrap_or(DataType::LargeBinary),
-                ))
-            }
-            crate::spec::PrimitiveType::Binary => {
+            PrimitiveType::Fixed(len) => Ok(ArrowSchemaOrFieldOrType::Type(
+                i32::try_from(*len)
+                    .ok()
+                    .map(DataType::FixedSizeBinary)
+                    .unwrap_or(DataType::LargeBinary),
+            )),
+            PrimitiveType::Binary => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::LargeBinary))
             }
         }
@@ -854,9 +884,7 @@ impl SchemaVisitor for ToArrowSchemaConverter {
 }
 
 /// Convert iceberg schema to an arrow schema.
-pub fn schema_to_arrow_schema(
-    schema: &crate::spec::Schema,
-) -> crate::Result<ArrowSchema> {
+pub fn schema_to_arrow_schema(schema: &Schema) -> Result<ArrowSchema> {
     let mut converter = ToArrowSchemaConverter;
     match crate::spec::visit_schema(schema, &mut converter)? {
         ArrowSchemaOrFieldOrType::Schema(schema) => Ok(schema),
@@ -865,7 +893,7 @@ pub fn schema_to_arrow_schema(
 }
 
 /// Convert iceberg type to an arrow type.
-pub fn type_to_arrow_type(ty: &crate::spec::Type) -> crate::Result<DataType> {
+pub fn type_to_arrow_type(ty: &Type) -> Result<DataType> {
     let mut converter = ToArrowSchemaConverter;
     match crate::spec::visit_type(ty, &mut converter)? {
         ArrowSchemaOrFieldOrType::Type(ty) => Ok(ty),
@@ -939,7 +967,9 @@ pub(crate) fn get_arrow_datum(
             let array = FixedSizeBinaryArray::try_from_iter(std::iter::once(
                 value.as_slice(),
             ))
-            .map_err(|e| Error::new(ErrorKind::DataInvalid, e.to_string()))?;
+            .map_err(|e| {
+                invalid_data!("FixedSizeBinary conversion failed").with_source(e)
+            })?;
             Ok(Arc::new(Scalar::new(array)))
         }
 
@@ -1013,7 +1043,15 @@ pub(crate) fn get_parquet_stat_min_as_datum(
             };
             Some(Datum::new(
                 primitive_type.clone(),
-                PrimitiveLiteral::Int128(i128::from_be_bytes(bytes.try_into()?)),
+                PrimitiveLiteral::Int128(
+                    // An empty bound carries no value; reject it rather than
+                    // decode it as zero, which could prune matching row groups.
+                    i128_from_be_bytes(bytes)
+                        .filter(|_| !bytes.is_empty())
+                        .ok_or_else(|| {
+                            invalid_data!("Can't convert bytes to i128: {bytes:?}")
+                        })?,
+                ),
             ))
         }
         (
@@ -1029,12 +1067,7 @@ pub(crate) fn get_parquet_stat_min_as_datum(
             Some(Datum::new(
                 primitive_type.clone(),
                 PrimitiveLiteral::Int128(i128_from_be_bytes(bytes).ok_or_else(
-                    || {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("Can't convert bytes to i128: {bytes:?}"),
-                        )
-                    },
+                    || invalid_data!("Can't convert bytes to i128: {bytes:?}"),
                 )?),
             ))
         }
@@ -1161,7 +1194,15 @@ pub(crate) fn get_parquet_stat_max_as_datum(
             };
             Some(Datum::new(
                 primitive_type.clone(),
-                PrimitiveLiteral::Int128(i128::from_be_bytes(bytes.try_into()?)),
+                PrimitiveLiteral::Int128(
+                    // An empty bound carries no value; reject it rather than
+                    // decode it as zero, which could prune matching row groups.
+                    i128_from_be_bytes(bytes)
+                        .filter(|_| !bytes.is_empty())
+                        .ok_or_else(|| {
+                            invalid_data!("Can't convert bytes to i128: {bytes:?}")
+                        })?,
+                ),
             ))
         }
         (
@@ -1177,12 +1218,7 @@ pub(crate) fn get_parquet_stat_max_as_datum(
             Some(Datum::new(
                 primitive_type.clone(),
                 PrimitiveLiteral::Int128(i128_from_be_bytes(bytes).ok_or_else(
-                    || {
-                        Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("Can't convert bytes to i128: {bytes:?}"),
-                        )
-                    },
+                    || invalid_data!("Can't convert bytes to i128: {bytes:?}"),
                 )?),
             ))
         }
@@ -1248,18 +1284,18 @@ pub(crate) fn get_parquet_stat_max_as_datum(
     })
 }
 
-impl TryFrom<&ArrowSchema> for crate::spec::Schema {
+impl TryFrom<&ArrowSchema> for Schema {
     type Error = Error;
 
-    fn try_from(schema: &ArrowSchema) -> crate::Result<Self> {
+    fn try_from(schema: &ArrowSchema) -> Result<Self> {
         arrow_schema_to_schema(schema)
     }
 }
 
-impl TryFrom<&crate::spec::Schema> for ArrowSchema {
+impl TryFrom<&Schema> for ArrowSchema {
     type Error = Error;
 
-    fn try_from(schema: &crate::spec::Schema) -> crate::Result<Self> {
+    fn try_from(schema: &Schema) -> Result<Self> {
         schema_to_arrow_schema(schema)
     }
 }
@@ -1290,7 +1326,8 @@ pub fn datum_to_arrow_type_with_ree(datum: &Datum) -> DataType {
 }
 
 /// Returns the run-end-encoded Arrow type used to materialize a per-file constant
-/// column of the given Iceberg primitive type.
+/// column of the given Iceberg primitive type. Shared by both the value and the
+/// all-null constant paths so a column keeps one Arrow type across files.
 pub(crate) fn primitive_type_to_arrow_type_with_ree(
     primitive_type: &PrimitiveType,
 ) -> DataType {
@@ -1332,15 +1369,43 @@ pub(crate) fn primitive_type_to_arrow_type_with_ree(
 /// including nested struct, list, and map fields. This is useful for schema comparison
 /// where metadata differences should be ignored.
 struct MetadataStripVisitor {
-    /// Stack to track field information during traversal
-    field_stack: Vec<Field>,
+    /// Fields whose types are still being visited, innermost last
+    pending_fields: Vec<PendingField>,
+}
+
+/// What `MetadataStripVisitor` keeps of a field until its type is visited
+struct PendingField {
+    name: String,
+    nullable: bool,
 }
 
 impl MetadataStripVisitor {
     fn new() -> Self {
         Self {
-            field_stack: Vec::new(),
+            pending_fields: Vec::new(),
         }
+    }
+
+    /// Records a field whose type is about to be visited.
+    fn start_field(&mut self, name: &str, nullable: bool) -> Result<()> {
+        self.pending_fields.push(PendingField {
+            name: name.to_string(),
+            nullable,
+        });
+        Ok(())
+    }
+
+    /// Builds the innermost pending field with `data_type` and no metadata.
+    /// `kind` names the type in the error for an unbalanced stack.
+    fn finish_field(&mut self, data_type: DataType, kind: &str) -> Result<Field> {
+        let PendingField { name, nullable } =
+            self.pending_fields.pop().ok_or_else(|| {
+                Error::new(
+                    ErrorKind::Unexpected,
+                    format!("Field stack underflow in {kind}"),
+                )
+            })?;
+        Ok(Field::new(name, data_type, nullable))
     }
 }
 
@@ -1349,17 +1414,20 @@ impl ArrowSchemaVisitor for MetadataStripVisitor {
     type U = ArrowSchema;
 
     fn before_field(&mut self, field: &FieldRef) -> Result<()> {
-        // Store field name and nullability for later reconstruction
-        self.field_stack.push(Field::new(
-            field.name(),
-            DataType::Null, // Placeholder, will be replaced
-            field.is_nullable(),
-        ));
-        Ok(())
+        self.start_field(field.name(), field.is_nullable())
     }
 
-    fn after_field(&mut self, _field: &FieldRef) -> Result<()> {
-        Ok(())
+    fn before_list_element(&mut self, field: &FieldRef) -> Result<()> {
+        self.start_field(LIST_FIELD_NAME, field.is_nullable())
+    }
+
+    fn before_map_key(&mut self, _field: &FieldRef) -> Result<()> {
+        // Map keys are always required, as `schema_to_arrow_schema` builds them.
+        self.start_field(MAP_KEY_FIELD_NAME, false)
+    }
+
+    fn before_map_value(&mut self, field: &FieldRef) -> Result<()> {
+        self.start_field(MAP_VALUE_FIELD_NAME, field.is_nullable())
     }
 
     fn schema(
@@ -1367,6 +1435,15 @@ impl ArrowSchemaVisitor for MetadataStripVisitor {
         _schema: &ArrowSchema,
         values: Vec<Self::T>,
     ) -> Result<Self::U> {
+        if !self.pending_fields.is_empty() {
+            return Err(Error::new(
+                ErrorKind::Unexpected,
+                format!(
+                    "{} fields left on the field stack after traversal",
+                    self.pending_fields.len()
+                ),
+            ));
+        }
         Ok(ArrowSchema::new(values))
     }
 
@@ -1375,26 +1452,10 @@ impl ArrowSchemaVisitor for MetadataStripVisitor {
         _fields: &Fields,
         results: Vec<Self::T>,
     ) -> Result<Self::T> {
-        // Pop the struct field from the stack
-        let field_info = self.field_stack.pop().ok_or_else(|| {
-            Error::new(ErrorKind::Unexpected, "Field stack underflow in struct")
-        })?;
-
-        // Reconstruct struct field without metadata
-        Ok(Field::new(
-            field_info.name(),
-            DataType::Struct(Fields::from(results)),
-            field_info.is_nullable(),
-        ))
+        self.finish_field(DataType::Struct(Fields::from(results)), "struct")
     }
 
     fn list(&mut self, list: &DataType, value: Self::T) -> Result<Self::T> {
-        // Pop the list field from the stack
-        let field_info = self.field_stack.pop().ok_or_else(|| {
-            Error::new(ErrorKind::Unexpected, "Field stack underflow in list")
-        })?;
-
-        // Reconstruct list field without metadata
         let list_type = match list {
             DataType::List(_) => DataType::List(Arc::new(value)),
             DataType::LargeList(_) => DataType::LargeList(Arc::new(value)),
@@ -1409,11 +1470,7 @@ impl ArrowSchemaVisitor for MetadataStripVisitor {
             }
         };
 
-        Ok(Field::new(
-            field_info.name(),
-            list_type,
-            field_info.is_nullable(),
-        ))
+        self.finish_field(list_type, "list")
     }
 
     fn map(
@@ -1422,11 +1479,6 @@ impl ArrowSchemaVisitor for MetadataStripVisitor {
         key_value: Self::T,
         value: Self::T,
     ) -> Result<Self::T> {
-        // Pop the map field from the stack
-        let field_info = self.field_stack.pop().ok_or_else(|| {
-            Error::new(ErrorKind::Unexpected, "Field stack underflow in map")
-        })?;
-
         // Reconstruct the map's struct field (contains key and value)
         let struct_field = Field::new(
             DEFAULT_MAP_FIELD_NAME,
@@ -1445,26 +1497,11 @@ impl ArrowSchemaVisitor for MetadataStripVisitor {
             }
         };
 
-        // Reconstruct map field without metadata
-        Ok(Field::new(
-            field_info.name(),
-            DataType::Map(Arc::new(struct_field), sorted),
-            field_info.is_nullable(),
-        ))
+        self.finish_field(DataType::Map(Arc::new(struct_field), sorted), "map")
     }
 
     fn primitive(&mut self, p: &DataType) -> Result<Self::T> {
-        // Pop the primitive field from the stack
-        let field_info = self.field_stack.pop().ok_or_else(|| {
-            Error::new(ErrorKind::Unexpected, "Field stack underflow in primitive")
-        })?;
-
-        // Return field without metadata
-        Ok(Field::new(
-            field_info.name(),
-            p.clone(),
-            field_info.is_nullable(),
-        ))
+        self.finish_field(p.clone(), "primitive")
     }
 }
 
@@ -1473,6 +1510,21 @@ impl ArrowSchemaVisitor for MetadataStripVisitor {
 /// This function recursively removes metadata from all fields at every level of the schema,
 /// including nested struct, list, and map fields. This is useful for schema comparison
 /// where metadata differences should be ignored.
+///
+/// Some other differences are normalized away too, so that schemas that differ only in
+/// them compare equal once stripped. The fields inside lists and maps are renamed as
+/// [`schema_to_arrow_schema`] names them, and dictionaries are unwrapped:
+/// - A list's element field is renamed to [`LIST_FIELD_NAME`], so `item` (the arrow-rs
+///   default) becomes `element`.
+/// - A map's entries field is renamed to [`DEFAULT_MAP_FIELD_NAME`] and made non-nullable.
+/// - A map's key and value fields are renamed to [`MAP_KEY_FIELD_NAME`] and
+///   [`MAP_VALUE_FIELD_NAME`], so `keys` and `values` (the arrow-rs `MapBuilder` default)
+///   become `key` and `value`, and the key is made non-nullable.
+/// - A dictionary-encoded field becomes a field of the dictionary's value type.
+///
+/// The names of the schema's fields and of struct fields are kept. Extension type
+/// metadata (`ARROW:extension:*`) is dropped with the rest, so a variant field becomes a
+/// plain struct of its `metadata` and `value` fields.
 ///
 /// # Arguments
 /// * `schema` - The Arrow schema to strip metadata from
@@ -1619,188 +1671,188 @@ mod tests {
 
     fn iceberg_schema_for_arrow_schema_to_schema_test() -> Schema {
         let schema_json = r#"{
-            "type":"struct",
-            "schema-id":0,
-            "fields":[
-                {
-                    "id":2,
-                    "name":"a",
-                    "required":true,
-                    "type":"int"
-                },
-                {
-                    "id":1,
-                    "name":"b",
-                    "required":true,
-                    "type":"long"
-                },
-                {
-                    "id":3,
-                    "name":"c",
-                    "required":true,
-                    "type":"string"
-                },
-                {
-                    "id":21,
-                    "name":"n",
-                    "required":true,
-                    "type":"string"
-                },
-                {
-                    "id":4,
-                    "name":"d",
-                    "required":false,
-                    "type":"timestamp"
-                },
-                {
-                    "id":6,
-                    "name":"e",
-                    "required":false,
-                    "type":"boolean"
-                },
-                {
-                    "id":5,
-                    "name":"f",
-                    "required":true,
-                    "type":"float"
-                },
-                {
-                    "id":7,
-                    "name":"g",
-                    "required":true,
-                    "type":"double"
-                },
-                {
-                    "id":27,
-                    "name":"p",
-                    "required":true,
-                    "type":"decimal(10,2)"
-                },
-                {
-                    "id":8,
-                    "name":"h",
-                    "required":true,
-                    "type":"date"
-                },
-                {
-                    "id":9,
-                    "name":"i",
-                    "required":true,
-                    "type":"time"
-                },
-                {
-                    "id":10,
-                    "name":"j",
-                    "required":true,
-                    "type":"timestamptz"
-                },
-                {
-                    "id":12,
-                    "name":"k",
-                    "required":true,
-                    "type":"timestamptz"
-                },
-                {
-                    "id":13,
-                    "name":"l",
-                    "required":true,
-                    "type":"binary"
-                },
-                {
-                    "id":22,
-                    "name":"o",
-                    "required":true,
-                    "type":"binary"
-                },
-                {
-                    "id":11,
-                    "name":"m",
-                    "required":true,
-                    "type":"fixed[10]"
-                },
-                {
-                    "id":14,
-                    "name":"list",
-                    "required": false,
-                    "type": {
-                        "type": "list",
-                        "element-id": 15,
-                        "element-required": true,
-                        "element": "int"
-                    }
-                },
-                {
-                    "id":24,
-                    "name":"large_list",
-                    "required": false,
-                    "type": {
-                        "type": "list",
-                        "element-id": 23,
-                        "element-required": true,
-                        "element": "string"
-                    }
-                },
-                {
-                    "id":25,
-                    "name":"fixed_list",
-                    "required": false,
-                    "type": {
-                        "type": "list",
-                        "element-id": 26,
-                        "element-required": true,
-                        "element": "binary"
-                    }
-                },
-                {
-                    "id":16,
-                    "name":"map",
-                    "required": true,
-                    "type": {
-                        "type": "map",
-                        "key-id": 28,
-                        "key": "int",
-                        "value-id": 29,
-                        "value-required": false,
-                        "value": "string"
-                    }
-                },
-                {
-                    "id":17,
-                    "name":"struct",
-                    "required": true,
-                    "type": {
-                        "type": "struct",
-                        "fields": [
-                            {
-                                "id":18,
-                                "name":"aa",
-                                "required":true,
-                                "type":"int"
-                            },
-                            {
-                                "id":19,
-                                "name":"bb",
-                                "required":false,
-                                "type":"string"
-                            },
-                            {
-                                "id":20,
-                                "name":"cc",
-                                "required":true,
-                                "type":"timestamp"
-                            }
-                        ]
-                    }
-                },
-                {
-                    "id":30,
-                    "name":"dictionary",
-                    "required":true,
-                    "type":"string"
+        "type":"struct",
+        "schema-id":0,
+        "fields":[
+            {
+                "id":2,
+                "name":"a",
+                "required":true,
+                "type":"int"
+            },
+            {
+                "id":1,
+                "name":"b",
+                "required":true,
+                "type":"long"
+            },
+            {
+                "id":3,
+                "name":"c",
+                "required":true,
+                "type":"string"
+            },
+            {
+                "id":21,
+                "name":"n",
+                "required":true,
+                "type":"string"
+            },
+            {
+                "id":4,
+                "name":"d",
+                "required":false,
+                "type":"timestamp"
+            },
+            {
+                "id":6,
+                "name":"e",
+                "required":false,
+                "type":"boolean"
+            },
+            {
+                "id":5,
+                "name":"f",
+                "required":true,
+                "type":"float"
+            },
+            {
+                "id":7,
+                "name":"g",
+                "required":true,
+                "type":"double"
+            },
+            {
+                "id":27,
+                "name":"p",
+                "required":true,
+                "type":"decimal(10,2)"
+            },
+            {
+                "id":8,
+                "name":"h",
+                "required":true,
+                "type":"date"
+            },
+            {
+                "id":9,
+                "name":"i",
+                "required":true,
+                "type":"time"
+            },
+            {
+                "id":10,
+                "name":"j",
+                "required":true,
+                "type":"timestamptz"
+            },
+            {
+                "id":12,
+                "name":"k",
+                "required":true,
+                "type":"timestamptz"
+            },
+            {
+                "id":13,
+                "name":"l",
+                "required":true,
+                "type":"binary"
+            },
+            {
+                "id":22,
+                "name":"o",
+                "required":true,
+                "type":"binary"
+            },
+            {
+                "id":11,
+                "name":"m",
+                "required":true,
+                "type":"fixed[10]"
+            },
+            {
+                "id":14,
+                "name":"list",
+                "required": false,
+                "type": {
+                    "type": "list",
+                    "element-id": 15,
+                    "element-required": true,
+                    "element": "int"
                 }
-            ],
-            "identifier-field-ids":[]
-        }"#;
+            },
+            {
+                "id":24,
+                "name":"large_list",
+                "required": false,
+                "type": {
+                    "type": "list",
+                    "element-id": 23,
+                    "element-required": true,
+                    "element": "string"
+                }
+            },
+            {
+                "id":25,
+                "name":"fixed_list",
+                "required": false,
+                "type": {
+                    "type": "list",
+                    "element-id": 26,
+                    "element-required": true,
+                    "element": "binary"
+                }
+            },
+            {
+                "id":16,
+                "name":"map",
+                "required": true,
+                "type": {
+                    "type": "map",
+                    "key-id": 28,
+                    "key": "int",
+                    "value-id": 29,
+                    "value-required": false,
+                    "value": "string"
+                }
+            },
+            {
+                "id":17,
+                "name":"struct",
+                "required": true,
+                "type": {
+                    "type": "struct",
+                    "fields": [
+                        {
+                            "id":18,
+                            "name":"aa",
+                            "required":true,
+                            "type":"int"
+                        },
+                        {
+                            "id":19,
+                            "name":"bb",
+                            "required":false,
+                            "type":"string"
+                        },
+                        {
+                            "id":20,
+                            "name":"cc",
+                            "required":true,
+                            "type":"timestamp"
+                        }
+                    ]
+                }
+            },
+            {
+                "id":30,
+                "name":"dictionary",
+                "required":true,
+                "type":"string"
+            }
+        ],
+        "identifier-field-ids":[]
+    }"#;
 
         let schema: Schema = serde_json::from_str(schema_json).unwrap();
         schema
@@ -1815,100 +1867,113 @@ mod tests {
     }
 
     #[test]
-    fn test_arrow_schema_to_schema_auto_assign_ids() {
+    fn test_converting_uuid_from_arrow_to_iceberg_to_arrow_should_give_uuid() {
         let arrow_schema = ArrowSchema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new(
-                "tags",
-                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
-                true,
-            ),
-            Field::new(
-                "address",
-                DataType::Struct(Fields::from(vec![
-                    Field::new("street", DataType::Utf8, true),
-                    Field::new("city", DataType::Utf8, false),
-                ])),
-                true,
-            ),
-            Field::new(
-                "attributes",
-                DataType::Map(
-                    Arc::new(Field::new(
-                        DEFAULT_MAP_FIELD_NAME,
-                        DataType::Struct(Fields::from(vec![
-                            Field::new("key", DataType::Utf8, false),
-                            Field::new("value", DataType::Utf8, true),
-                        ])),
-                        false,
-                    )),
-                    false,
-                ),
-                true,
-            ),
+            simple_field("uuid_field", DataType::FixedSizeBinary(16), false, "1")
+                .with_extension_type(UuidExtensionType),
         ]);
+        let output =
+            schema_to_arrow_schema(&arrow_schema_to_schema(&arrow_schema).unwrap())
+                .unwrap();
 
-        let schema = arrow_schema_to_schema_auto_assign_ids(&arrow_schema).unwrap();
-        let expected = Schema::builder()
+        assert_eq!(arrow_schema, output);
+    }
+
+    #[test]
+    fn test_converting_uuid_from_iceberg_to_arrow_to_iceberg_should_give_uuid() {
+        let iceberg_schema = Schema::builder()
             .with_fields(vec![
-                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long))
-                    .into(),
                 NestedField::optional(
-                    2,
-                    "tags",
-                    Type::List(ListType {
-                        element_field: NestedField::list_element(
-                            5,
-                            Type::Primitive(PrimitiveType::String),
-                            false,
-                        )
-                        .into(),
-                    }),
-                )
-                .into(),
-                NestedField::optional(
-                    3,
-                    "address",
-                    Type::Struct(StructType::new(vec![
-                        NestedField::optional(
-                            6,
-                            "street",
-                            Type::Primitive(PrimitiveType::String),
-                        )
-                        .into(),
-                        NestedField::required(
-                            7,
-                            "city",
-                            Type::Primitive(PrimitiveType::String),
-                        )
-                        .into(),
-                    ])),
-                )
-                .into(),
-                NestedField::optional(
-                    4,
-                    "attributes",
-                    Type::Map(MapType {
-                        key_field: NestedField::map_key_element(
-                            8,
-                            Type::Primitive(PrimitiveType::String),
-                        )
-                        .into(),
-                        value_field: NestedField::map_value_element(
-                            9,
-                            Type::Primitive(PrimitiveType::String),
-                            false,
-                        )
-                        .into(),
-                    }),
+                    1,
+                    "uuid_field",
+                    Type::Primitive(PrimitiveType::Uuid),
                 )
                 .into(),
             ])
             .build()
             .unwrap();
+        let output =
+            arrow_schema_to_schema(&schema_to_arrow_schema(&iceberg_schema).unwrap())
+                .unwrap();
 
-        pretty_assertions::assert_eq!(schema, expected);
-        assert_eq!(schema.highest_field_id(), 9);
+        assert_eq!(iceberg_schema, output);
+    }
+
+    #[test]
+    fn test_arrow_schema_to_schema_should_convert_uuid_when_fixed_size_binary() {
+        let converted_schema = arrow_schema_to_schema(&ArrowSchema::new(vec![
+            simple_field("uuid_field", DataType::FixedSizeBinary(16), false, "1")
+                .with_extension_type(UuidExtensionType),
+        ]))
+        .unwrap();
+
+        let expected = Schema::builder()
+            .with_fields([NestedField::required(
+                1,
+                "uuid_field",
+                Type::Primitive(PrimitiveType::Uuid),
+            )
+            .into()])
+            .build()
+            .unwrap();
+
+        pretty_assertions::assert_eq!(expected, converted_schema);
+    }
+
+    #[test]
+    fn test_arrow_schema_to_schema_should_reject_uuid_when_not_a_fixed_size_binary() {
+        // The field must be built correctly, and then changed to the wrong type,
+        // to avoid Arrow's own validation and panic.
+        let field = simple_field_with_uuid_ext(DataType::Utf8);
+
+        let error =
+            arrow_schema_to_schema(&ArrowSchema::new(vec![field])).unwrap_err();
+
+        pretty_assertions::assert_eq!(
+            "arrow.uuid extension requires FixedSizeBinary(16) storage, found Utf8",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn test_arrow_schema_to_schema_should_reject_uuid_when_fixed_size_binary_that_is_less_than_16()
+     {
+        let field = simple_field_with_uuid_ext(DataType::FixedSizeBinary(8));
+        let error =
+            arrow_schema_to_schema(&ArrowSchema::new(vec![field])).unwrap_err();
+
+        pretty_assertions::assert_eq!(
+            "arrow.uuid extension requires FixedSizeBinary(16) storage, found FixedSizeBinary(8)",
+            error.message()
+        );
+    }
+
+    #[test]
+    fn test_arrow_schema_to_schema_should_reject_uuid_when_fixed_size_binary_that_is_more_than_16()
+     {
+        let field = simple_field_with_uuid_ext(DataType::FixedSizeBinary(17));
+        let error =
+            arrow_schema_to_schema(&ArrowSchema::new(vec![field])).unwrap_err();
+
+        pretty_assertions::assert_eq!(
+            "arrow.uuid extension requires FixedSizeBinary(16) storage, found FixedSizeBinary(17)",
+            error.message()
+        );
+    }
+
+    fn simple_field_with_uuid_ext(field_data_type: DataType) -> Field {
+        let mut field =
+            simple_field("uuid_field", DataType::FixedSizeBinary(16), false, "1")
+                .with_extension_type(UuidExtensionType);
+
+        // We want to allow setting a UUID extension to the wrong data type.
+        // This is to test our logic against bad schemas.
+        //
+        // To avoid Arrow's own internal validation and panic, we need to build
+        // the field correctly above, and then manually override the type here.
+        field = field.with_data_type(field_data_type);
+
+        field
     }
 
     fn arrow_schema_for_schema_to_arrow_schema_test() -> ArrowSchema {
@@ -2003,7 +2068,8 @@ mod tests {
             ),
             simple_field("map", map, false, "16"),
             simple_field("struct", r#struct, false, "17"),
-            simple_field("uuid", DataType::FixedSizeBinary(16), false, "30"),
+            simple_field("uuid", DataType::FixedSizeBinary(16), false, "30")
+                .with_extension_type(UuidExtensionType),
             Field::new(
                 "v",
                 DataType::Struct(Fields::from(vec![
@@ -2024,194 +2090,194 @@ mod tests {
 
     fn iceberg_schema_for_schema_to_arrow_schema() -> Schema {
         let schema_json = r#"{
-            "type":"struct",
-            "schema-id":0,
-            "fields":[
-                {
-                    "id":2,
-                    "name":"a",
-                    "required":true,
-                    "type":"int"
-                },
-                {
-                    "id":1,
-                    "name":"b",
-                    "required":true,
-                    "type":"long"
-                },
-                {
-                    "id":3,
-                    "name":"c",
-                    "required":true,
-                    "type":"string"
-                },
-                {
-                    "id":21,
-                    "name":"n",
-                    "required":true,
-                    "type":"string"
-                },
-                {
-                    "id":4,
-                    "name":"d",
-                    "required":false,
-                    "type":"timestamp"
-                },
-                {
-                    "id":6,
-                    "name":"e",
-                    "required":false,
-                    "type":"boolean"
-                },
-                {
-                    "id":5,
-                    "name":"f",
-                    "required":true,
-                    "type":"float"
-                },
-                {
-                    "id":7,
-                    "name":"g",
-                    "required":true,
-                    "type":"double"
-                },
-                {
-                    "id":27,
-                    "name":"p",
-                    "required":true,
-                    "type":"decimal(10,2)"
-                },
-                {
-                    "id":8,
-                    "name":"h",
-                    "required":true,
-                    "type":"date"
-                },
-                {
-                    "id":9,
-                    "name":"i",
-                    "required":true,
-                    "type":"time"
-                },
-                {
-                    "id":10,
-                    "name":"j",
-                    "required":true,
-                    "type":"timestamptz"
-                },
-                {
-                    "id":12,
-                    "name":"k",
-                    "required":true,
-                    "type":"timestamptz"
-                },
-                {
-                    "id":13,
-                    "name":"l",
-                    "required":true,
-                    "type":"binary"
-                },
-                {
-                    "id":22,
-                    "name":"o",
-                    "required":true,
-                    "type":"binary"
-                },
-                {
-                    "id":11,
-                    "name":"m",
-                    "required":true,
-                    "type":"fixed[10]"
-                },
-                {
-                    "id":14,
-                    "name":"list",
-                    "required": false,
-                    "type": {
-                        "type": "list",
-                        "element-id": 15,
-                        "element-required": true,
-                        "element": "int"
-                    }
-                },
-                {
-                    "id":24,
-                    "name":"large_list",
-                    "required": false,
-                    "type": {
-                        "type": "list",
-                        "element-id": 23,
-                        "element-required": true,
-                        "element": "string"
-                    }
-                },
-                {
-                    "id":25,
-                    "name":"fixed_list",
-                    "required": false,
-                    "type": {
-                        "type": "list",
-                        "element-id": 26,
-                        "element-required": true,
-                        "element": "binary"
-                    }
-                },
-                {
-                    "id":16,
-                    "name":"map",
-                    "required": true,
-                    "type": {
-                        "type": "map",
-                        "key-id": 28,
-                        "key": "int",
-                        "value-id": 29,
-                        "value-required": false,
-                        "value": "string"
-                    }
-                },
-                {
-                    "id":17,
-                    "name":"struct",
-                    "required": true,
-                    "type": {
-                        "type": "struct",
-                        "fields": [
-                            {
-                                "id":18,
-                                "name":"aa",
-                                "required":true,
-                                "type":"int"
-                            },
-                            {
-                                "id":19,
-                                "name":"bb",
-                                "required":false,
-                                "type":"string"
-                            },
-                            {
-                                "id":20,
-                                "name":"cc",
-                                "required":true,
-                                "type":"timestamp"
-                            }
-                        ]
-                    }
-                },
-                {
-                    "id":30,
-                    "name":"uuid",
-                    "required":true,
-                    "type":"uuid"
-                },
-                {
-                    "id":31,
-                    "name":"v",
-                    "required":false,
-                    "type":"variant"
+        "type":"struct",
+        "schema-id":0,
+        "fields":[
+            {
+                "id":2,
+                "name":"a",
+                "required":true,
+                "type":"int"
+            },
+            {
+                "id":1,
+                "name":"b",
+                "required":true,
+                "type":"long"
+            },
+            {
+                "id":3,
+                "name":"c",
+                "required":true,
+                "type":"string"
+            },
+            {
+                "id":21,
+                "name":"n",
+                "required":true,
+                "type":"string"
+            },
+            {
+                "id":4,
+                "name":"d",
+                "required":false,
+                "type":"timestamp"
+            },
+            {
+                "id":6,
+                "name":"e",
+                "required":false,
+                "type":"boolean"
+            },
+            {
+                "id":5,
+                "name":"f",
+                "required":true,
+                "type":"float"
+            },
+            {
+                "id":7,
+                "name":"g",
+                "required":true,
+                "type":"double"
+            },
+            {
+                "id":27,
+                "name":"p",
+                "required":true,
+                "type":"decimal(10,2)"
+            },
+            {
+                "id":8,
+                "name":"h",
+                "required":true,
+                "type":"date"
+            },
+            {
+                "id":9,
+                "name":"i",
+                "required":true,
+                "type":"time"
+            },
+            {
+                "id":10,
+                "name":"j",
+                "required":true,
+                "type":"timestamptz"
+            },
+            {
+                "id":12,
+                "name":"k",
+                "required":true,
+                "type":"timestamptz"
+            },
+            {
+                "id":13,
+                "name":"l",
+                "required":true,
+                "type":"binary"
+            },
+            {
+                "id":22,
+                "name":"o",
+                "required":true,
+                "type":"binary"
+            },
+            {
+                "id":11,
+                "name":"m",
+                "required":true,
+                "type":"fixed[10]"
+            },
+            {
+                "id":14,
+                "name":"list",
+                "required": false,
+                "type": {
+                    "type": "list",
+                    "element-id": 15,
+                    "element-required": true,
+                    "element": "int"
                 }
-            ],
-            "identifier-field-ids":[]
-        }"#;
+            },
+            {
+                "id":24,
+                "name":"large_list",
+                "required": false,
+                "type": {
+                    "type": "list",
+                    "element-id": 23,
+                    "element-required": true,
+                    "element": "string"
+                }
+            },
+            {
+                "id":25,
+                "name":"fixed_list",
+                "required": false,
+                "type": {
+                    "type": "list",
+                    "element-id": 26,
+                    "element-required": true,
+                    "element": "binary"
+                }
+            },
+            {
+                "id":16,
+                "name":"map",
+                "required": true,
+                "type": {
+                    "type": "map",
+                    "key-id": 28,
+                    "key": "int",
+                    "value-id": 29,
+                    "value-required": false,
+                    "value": "string"
+                }
+            },
+            {
+                "id":17,
+                "name":"struct",
+                "required": true,
+                "type": {
+                    "type": "struct",
+                    "fields": [
+                        {
+                            "id":18,
+                            "name":"aa",
+                            "required":true,
+                            "type":"int"
+                        },
+                        {
+                            "id":19,
+                            "name":"bb",
+                            "required":false,
+                            "type":"string"
+                        },
+                        {
+                            "id":20,
+                            "name":"cc",
+                            "required":true,
+                            "type":"timestamp"
+                        }
+                    ]
+                }
+            },
+            {
+                "id":30,
+                "name":"uuid",
+                "required":true,
+                "type":"uuid"
+            },
+            {
+                "id":31,
+                "name":"v",
+                "required":false,
+                "type":"variant"
+            }
+        ],
+        "identifier-field-ids":[]
+    }"#;
 
         let schema: Schema = serde_json::from_str(schema_json).unwrap();
         schema
@@ -2219,10 +2285,10 @@ mod tests {
 
     #[test]
     fn test_schema_to_arrow_schema() {
-        let arrow_schema = arrow_schema_for_schema_to_arrow_schema_test();
+        let expected_arrow_schema = arrow_schema_for_schema_to_arrow_schema_test();
         let schema = iceberg_schema_for_schema_to_arrow_schema();
         let converted_arrow_schema = schema_to_arrow_schema(&schema).unwrap();
-        assert_eq!(converted_arrow_schema, arrow_schema);
+        assert_eq!(converted_arrow_schema, expected_arrow_schema);
     }
 
     #[test]
@@ -2266,6 +2332,32 @@ mod tests {
                 Field::new("value", DataType::Binary, true),
             ]))
         );
+    }
+
+    #[test]
+    fn test_schema_to_arrow_schema_should_convert_uuid_to_arrow_uuid() {
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(
+                    1,
+                    "uuid_field",
+                    Type::Primitive(PrimitiveType::Uuid),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let arrow_schema = schema_to_arrow_schema(&schema).unwrap();
+        let field = arrow_schema.field_with_name("uuid_field").unwrap();
+
+        assert_eq!(field.extension_type_name(), Some(UuidExtensionType::NAME));
+        // Attaching the extension type must not clobber the Iceberg field id.
+        assert_eq!(
+            field.metadata().get(PARQUET_FIELD_ID_META_KEY),
+            Some(&"1".to_string())
+        );
+        assert_eq!(*field.data_type(), DataType::FixedSizeBinary(16));
     }
 
     #[test]
@@ -2331,12 +2423,143 @@ mod tests {
         assert_eq!(value.extension_type_name(), Some("arrow.parquet.variant"));
     }
 
+    /// The unshredded Arrow storage of a variant: `metadata` (required) + `value`
+    /// (nullable) binary, with no field ids on the sub-fields.
+    fn variant_storage() -> DataType {
+        DataType::Struct(Fields::from(vec![
+            Field::new("metadata", DataType::Binary, false),
+            Field::new("value", DataType::Binary, true),
+        ]))
+    }
+
+    #[test]
+    fn test_variant_arrow_field_folds_to_iceberg_variant() {
+        // A field tagged with the arrow.parquet.variant extension is folded into an
+        // atomic Type::Variant; its storage sub-fields (which carry no field id) are
+        // never descended into.
+        let field = simple_field("v", variant_storage(), true, "1")
+            .with_extension_type(VariantExtensionType);
+        let arrow_schema = ArrowSchema::new(vec![field]);
+
+        let converted = arrow_schema_to_schema(&arrow_schema).unwrap();
+        let expected = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "v", Type::Variant(VariantType)).into(),
+            ])
+            .build()
+            .unwrap();
+        pretty_assertions::assert_eq!(converted, expected);
+    }
+
+    #[test]
+    fn test_variant_schema_round_trips() {
+        // Iceberg -> Arrow -> Iceberg is the identity for variants at every position:
+        // top-level, nested in a struct, as a list element, and as a map value.
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "v", Type::Variant(VariantType)).into(),
+                NestedField::optional(
+                    2,
+                    "s",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(3, "sv", Type::Variant(VariantType))
+                            .into(),
+                    ])),
+                )
+                .into(),
+                NestedField::optional(
+                    4,
+                    "l",
+                    Type::List(ListType::new(
+                        NestedField::optional(
+                            5,
+                            "element",
+                            Type::Variant(VariantType),
+                        )
+                        .into(),
+                    )),
+                )
+                .into(),
+                NestedField::optional(
+                    6,
+                    "m",
+                    Type::Map(MapType::new(
+                        NestedField::map_key_element(
+                            7,
+                            Type::Primitive(PrimitiveType::String),
+                        )
+                        .into(),
+                        NestedField::map_value_element(
+                            8,
+                            Type::Variant(VariantType),
+                            false,
+                        )
+                        .into(),
+                    )),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let arrow_schema = schema_to_arrow_schema(&schema).unwrap();
+        let round_tripped = arrow_schema_to_schema(&arrow_schema).unwrap();
+        pretty_assertions::assert_eq!(round_tripped, schema);
+    }
+
+    #[test]
+    fn test_variant_recognized_with_auto_assigned_ids() {
+        // Recognition also works when the Arrow schema has no field ids: the variant
+        // field gets an auto-assigned id and its storage is still not descended into.
+        let field = Field::new("v", variant_storage(), true)
+            .with_extension_type(VariantExtensionType);
+        let arrow_schema = ArrowSchema::new(vec![field]);
+
+        let converted =
+            arrow_schema_to_schema_auto_assign_ids(&arrow_schema).unwrap();
+        let expected = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "v", Type::Variant(VariantType)).into(),
+            ])
+            .build()
+            .unwrap();
+        pretty_assertions::assert_eq!(converted, expected);
+    }
+
+    #[test]
+    fn test_variant_extension_on_non_struct_storage_is_rejected() {
+        // The extension may only sit on struct storage. A hand-injected tag on a
+        // non-struct field is rejected rather than silently reinterpreted as a variant.
+        let field =
+            Field::new("v", DataType::Int32, true).with_metadata(HashMap::from([
+                (PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string()),
+                (
+                    arrow_schema::extension::EXTENSION_TYPE_NAME_KEY.to_string(),
+                    VariantExtensionType::NAME.to_string(),
+                ),
+            ]));
+        let arrow_schema = ArrowSchema::new(vec![field]);
+
+        let err = arrow_schema_to_schema(&arrow_schema).unwrap_err();
+        assert!(
+            err.to_string().contains("requires Struct storage"),
+            "unexpected error: {err}"
+        );
+    }
+
     #[test]
     fn test_type_conversion() {
         // test primitive type
         {
             let arrow_type = DataType::Int32;
             let iceberg_type = Type::Primitive(PrimitiveType::Int);
+            assert_eq!(arrow_type, type_to_arrow_type(&iceberg_type).unwrap());
+            assert_eq!(iceberg_type, arrow_type_to_type(&arrow_type).unwrap());
+        }
+
+        {
+            let arrow_type = DataType::Null;
+            let iceberg_type = Type::Primitive(PrimitiveType::Unknown);
             assert_eq!(arrow_type, type_to_arrow_type(&iceberg_type).unwrap());
             assert_eq!(iceberg_type, arrow_type_to_type(&arrow_type).unwrap());
         }
@@ -2612,6 +2835,656 @@ mod tests {
             assert!(is_scalar);
             assert_eq!(array.value_length(), 8);
             assert_eq!(array.value(0), &[1u8, 2, 3, 4, 5, 6, 7, 8]);
+        }
+    }
+
+    #[test]
+    fn test_arrow_schema_to_schema_with_field_id() {
+        // Create a complex Arrow schema without field ID metadata
+        // Including: primitives, list, nested struct, map, and nested list of structs
+        let arrow_schema = ArrowSchema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, true),
+            Field::new("price", DataType::Decimal128(10, 2), false),
+            Field::new("uuid", DataType::FixedSizeBinary(16), false)
+                .with_extension_type(UuidExtensionType),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                true,
+            ),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+            Field::new(
+                "address",
+                DataType::Struct(Fields::from(vec![
+                    Field::new("street", DataType::Utf8, true),
+                    Field::new("city", DataType::Utf8, false),
+                    Field::new("zip", DataType::Int32, true),
+                ])),
+                true,
+            ),
+            Field::new(
+                "attributes",
+                DataType::Map(
+                    Arc::new(Field::new(
+                        DEFAULT_MAP_FIELD_NAME,
+                        DataType::Struct(Fields::from(vec![
+                            Field::new("key", DataType::Utf8, false),
+                            Field::new("value", DataType::Utf8, true),
+                        ])),
+                        false,
+                    )),
+                    false,
+                ),
+                true,
+            ),
+            Field::new(
+                "orders",
+                DataType::List(Arc::new(Field::new(
+                    "element",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("order_id", DataType::Int64, false),
+                        Field::new("amount", DataType::Float64, false),
+                    ])),
+                    true,
+                ))),
+                true,
+            ),
+        ]);
+
+        let schema = arrow_schema_to_schema_auto_assign_ids(&arrow_schema).unwrap();
+
+        // Build expected schema with exact field IDs following level-order assignment:
+        // Level 0: id=1, name=2, price=3, uuid=4, created_at=5, tags=6, address=7, attributes=8, orders=9
+        // Level 1: tags.element=10, address.{street=11,city=12,zip=13}, attributes.{key=14,value=15}, orders.element=16
+        // Level 2: orders.element.{order_id=17,amount=18}
+        let expected = Schema::builder()
+            .with_fields(vec![
+                NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long))
+                    .into(),
+                NestedField::optional(
+                    2,
+                    "name",
+                    Type::Primitive(PrimitiveType::String),
+                )
+                .into(),
+                NestedField::required(
+                    3,
+                    "price",
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: 10,
+                        scale: 2,
+                    }),
+                )
+                .into(),
+                NestedField::required(
+                    4,
+                    "uuid",
+                    Type::Primitive(PrimitiveType::Uuid),
+                )
+                .into(),
+                NestedField::optional(
+                    5,
+                    "created_at",
+                    Type::Primitive(PrimitiveType::Timestamptz),
+                )
+                .into(),
+                NestedField::optional(
+                    6,
+                    "tags",
+                    Type::List(ListType {
+                        element_field: NestedField::list_element(
+                            10,
+                            Type::Primitive(PrimitiveType::String),
+                            false,
+                        )
+                        .into(),
+                    }),
+                )
+                .into(),
+                NestedField::optional(
+                    7,
+                    "address",
+                    Type::Struct(StructType::new(vec![
+                        NestedField::optional(
+                            11,
+                            "street",
+                            Type::Primitive(PrimitiveType::String),
+                        )
+                        .into(),
+                        NestedField::required(
+                            12,
+                            "city",
+                            Type::Primitive(PrimitiveType::String),
+                        )
+                        .into(),
+                        NestedField::optional(
+                            13,
+                            "zip",
+                            Type::Primitive(PrimitiveType::Int),
+                        )
+                        .into(),
+                    ])),
+                )
+                .into(),
+                NestedField::optional(
+                    8,
+                    "attributes",
+                    Type::Map(MapType {
+                        key_field: NestedField::map_key_element(
+                            14,
+                            Type::Primitive(PrimitiveType::String),
+                        )
+                        .into(),
+                        value_field: NestedField::map_value_element(
+                            15,
+                            Type::Primitive(PrimitiveType::String),
+                            false,
+                        )
+                        .into(),
+                    }),
+                )
+                .into(),
+                NestedField::optional(
+                    9,
+                    "orders",
+                    Type::List(ListType {
+                        element_field: NestedField::list_element(
+                            16,
+                            Type::Struct(StructType::new(vec![
+                                NestedField::required(
+                                    17,
+                                    "order_id",
+                                    Type::Primitive(PrimitiveType::Long),
+                                )
+                                .into(),
+                                NestedField::required(
+                                    18,
+                                    "amount",
+                                    Type::Primitive(PrimitiveType::Double),
+                                )
+                                .into(),
+                            ])),
+                            false,
+                        )
+                        .into(),
+                    }),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
+        pretty_assertions::assert_eq!(schema, expected);
+        assert_eq!(schema.highest_field_id(), 18);
+    }
+
+    fn decimal_byte_array_stats(min: Vec<u8>, max: Vec<u8>) -> Statistics {
+        Statistics::byte_array(
+            Some(parquet::data_type::ByteArray::from(min)),
+            Some(parquet::data_type::ByteArray::from(max)),
+            None,
+            Some(0),
+            false,
+        )
+    }
+
+    fn decimal_bounds(stats: &Statistics) -> Result<(Option<Datum>, Option<Datum>)> {
+        let ty = PrimitiveType::Decimal {
+            precision: 38,
+            scale: 2,
+        };
+        Ok((
+            get_parquet_stat_min_as_datum(&ty, stats)?,
+            get_parquet_stat_max_as_datum(&ty, stats)?,
+        ))
+    }
+
+    fn decimal_datum(value: i128) -> Datum {
+        Datum::new(
+            PrimitiveType::Decimal {
+                precision: 38,
+                scale: 2,
+            },
+            PrimitiveLiteral::Int128(value),
+        )
+    }
+
+    #[test]
+    fn test_byte_array_decimal_stats_short_bounds() {
+        // Minimal-length big-endian two's-complement: -1234 and 1234.
+        let stats = decimal_byte_array_stats(vec![0xFB, 0x2E], vec![0x04, 0xD2]);
+        let (min, max) = decimal_bounds(&stats).unwrap();
+        assert_eq!(min, Some(decimal_datum(-1234)));
+        assert_eq!(max, Some(decimal_datum(1234)));
+
+        // Single-byte bounds: sign bit set must sign-extend, not zero-extend.
+        let stats = decimal_byte_array_stats(vec![0x80], vec![0x7F]);
+        let (min, max) = decimal_bounds(&stats).unwrap();
+        assert_eq!(min, Some(decimal_datum(-128)));
+        assert_eq!(max, Some(decimal_datum(127)));
+    }
+
+    #[test]
+    fn test_byte_array_decimal_stats_full_width_bounds() {
+        let stats = decimal_byte_array_stats(
+            i128::MIN.to_be_bytes().to_vec(),
+            i128::MAX.to_be_bytes().to_vec(),
+        );
+        let (min, max) = decimal_bounds(&stats).unwrap();
+        assert_eq!(min, Some(decimal_datum(i128::MIN)));
+        assert_eq!(max, Some(decimal_datum(i128::MAX)));
+    }
+
+    #[test]
+    fn test_byte_array_decimal_stats_empty_bound_errors() {
+        let stats = decimal_byte_array_stats(vec![], vec![0x01]);
+        let err = decimal_bounds(&stats).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+
+        let stats = decimal_byte_array_stats(vec![0x01], vec![]);
+        let err = decimal_bounds(&stats).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    #[test]
+    fn test_byte_array_decimal_stats_oversized_bound_errors() {
+        let stats = decimal_byte_array_stats(vec![0; 17], vec![0x01]);
+        let err = decimal_bounds(&stats).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+
+        let stats = decimal_byte_array_stats(vec![0x01], vec![0; 17]);
+        let err = decimal_bounds(&stats).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::DataInvalid);
+    }
+
+    /// Every field is rebuilt without metadata, at any depth and inside any
+    /// container. Fields are rebuilt in nesting order rather than looked up by
+    /// name, so a path that repeats names (`a.b.a.b`) keeps each level's name
+    /// and nullability.
+    #[test]
+    fn test_strip_metadata_from_nested_schema() {
+        // The same schema, built with and without metadata on the schema and every field.
+        let schema = |with_metadata: bool| {
+            let metadata = |value: &str| {
+                if with_metadata {
+                    HashMap::from([("k".to_string(), value.to_string())])
+                } else {
+                    HashMap::new()
+                }
+            };
+            let field = |name: &str, ty: DataType, nullable: bool| {
+                Field::new(name, ty, nullable).with_metadata(metadata(name))
+            };
+            let element = |ty: DataType| Arc::new(field(LIST_FIELD_NAME, ty, false));
+            let ints = || DataType::List(element(DataType::Int32));
+            let map = |value: DataType, sorted: bool| {
+                let entries = Fields::from(vec![
+                    field(MAP_KEY_FIELD_NAME, DataType::Utf8, false),
+                    field(MAP_VALUE_FIELD_NAME, value, true),
+                ]);
+                let entries =
+                    field(DEFAULT_MAP_FIELD_NAME, DataType::Struct(entries), false);
+                DataType::Map(Arc::new(entries), sorted)
+            };
+            let struct_of =
+                |fields: Vec<Field>| DataType::Struct(Fields::from(fields));
+
+            let a_b_a_b = struct_of(vec![field(
+                "b",
+                struct_of(vec![field(
+                    "a",
+                    struct_of(vec![field("b", DataType::Int32, true)]),
+                    false,
+                )]),
+                false,
+            )]);
+            ArrowSchema::new(vec![
+                field("list", ints(), true),
+                field(
+                    "large_list",
+                    DataType::LargeList(element(DataType::Int32)),
+                    false,
+                ),
+                field(
+                    "fixed_list",
+                    DataType::FixedSizeList(element(DataType::Int32), 2),
+                    true,
+                ),
+                field("list_of_list", DataType::List(element(ints())), false),
+                field("sorted_map", map(ints(), true), false),
+                field(
+                    "map_of_struct",
+                    map(
+                        struct_of(vec![
+                            field("a", DataType::Int32, true),
+                            field("b", ints(), false),
+                        ]),
+                        false,
+                    ),
+                    true,
+                ),
+                field(
+                    "list_of_struct",
+                    DataType::List(element(struct_of(vec![field(
+                        "m",
+                        map(ints(), false),
+                        true,
+                    )]))),
+                    true,
+                ),
+                field("a", a_b_a_b, true),
+            ])
+            .with_metadata(metadata("schema"))
+        };
+
+        let (input, expected) = (schema(true), schema(false));
+        // Otherwise a builder that stopped adding metadata would pass trivially.
+        assert_ne!(input, expected);
+        pretty_assertions::assert_eq!(
+            strip_metadata_from_schema(&input).unwrap(),
+            expected
+        );
+    }
+
+    /// arrow-rs names a list's element `item`, and an arrow-rs `MapBuilder` names
+    /// a map's fields `entries`, `keys` and `values`. Once stripped, a schema
+    /// using those names, with a nullable map key, compares equal to the same
+    /// schema from `schema_to_arrow_schema`.
+    #[test]
+    fn test_strip_metadata_normalizes_container_field_names() {
+        // A list of ints and a map from string to a list of ints, with the given
+        // names for the list elements and the map's entries, key and value.
+        let schema = |[element, entries, key, value]: [&str; 4],
+                      key_nullable: bool| {
+            let ints = |nullable| {
+                DataType::List(Arc::new(Field::new(
+                    element,
+                    DataType::Int32,
+                    nullable,
+                )))
+            };
+            let key_value = Fields::from(vec![
+                Field::new(key, DataType::Utf8, key_nullable),
+                Field::new(value, ints(false), true),
+            ]);
+            let entries = Field::new(entries, DataType::Struct(key_value), false);
+            ArrowSchema::new(vec![
+                Field::new("l", ints(true), true),
+                Field::new("m", DataType::Map(Arc::new(entries), false), true),
+            ])
+        };
+        let arrow_rs = schema(["item", "entries", "keys", "values"], true);
+        let expected = schema(
+            [
+                LIST_FIELD_NAME,
+                DEFAULT_MAP_FIELD_NAME,
+                MAP_KEY_FIELD_NAME,
+                MAP_VALUE_FIELD_NAME,
+            ],
+            false,
+        );
+
+        // The same schema as an Iceberg table's.
+        let int_list = |id, required| {
+            let int = Type::Primitive(PrimitiveType::Int);
+            Type::List(ListType::new(
+                NestedField::list_element(id, int, required).into(),
+            ))
+        };
+        let string_to_int_list = MapType::new(
+            NestedField::map_key_element(4, Type::Primitive(PrimitiveType::String))
+                .into(),
+            NestedField::map_value_element(5, int_list(6, true), false).into(),
+        );
+        let iceberg = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "l", int_list(2, false)).into(),
+                NestedField::optional(3, "m", Type::Map(string_to_int_list)).into(),
+            ])
+            .build()
+            .unwrap();
+
+        pretty_assertions::assert_eq!(
+            strip_metadata_from_schema(&arrow_rs).unwrap(),
+            expected
+        );
+        pretty_assertions::assert_eq!(
+            strip_metadata_from_schema(&schema_to_arrow_schema(&iceberg).unwrap())
+                .unwrap(),
+            expected
+        );
+    }
+
+    /// Names and nullability that `schema_to_arrow_schema` doesn't fix, such as a
+    /// struct field's name or a list element's nullability, still tell schemas apart.
+    #[test]
+    fn test_strip_metadata_keeps_other_differences() {
+        let schema = |child: &str, element_nullable: bool| {
+            let child = Field::new(child, DataType::Int32, true);
+            let element = Field::new("item", DataType::Int32, element_nullable);
+            ArrowSchema::new(vec![
+                Field::new("s", DataType::Struct(Fields::from(vec![child])), true),
+                Field::new("l", DataType::List(Arc::new(element)), true),
+            ])
+        };
+        let strip =
+            |schema: ArrowSchema| strip_metadata_from_schema(&schema).unwrap();
+
+        assert_ne!(strip(schema("a", true)), strip(schema("b", true)));
+        assert_ne!(strip(schema("a", true)), strip(schema("a", false)));
+    }
+
+    /// Stripping drops the `arrow.parquet.variant` extension type with the rest of
+    /// the metadata, so a variant becomes a plain struct, in a list or map too.
+    #[test]
+    fn test_strip_metadata_turns_variants_into_structs() {
+        let variant = || Type::Variant(VariantType);
+        let schema = Schema::builder()
+            .with_fields(vec![
+                NestedField::optional(1, "v", variant()).into(),
+                NestedField::optional(
+                    2,
+                    "l",
+                    Type::List(ListType::new(
+                        NestedField::list_element(3, variant(), false).into(),
+                    )),
+                )
+                .into(),
+                NestedField::optional(
+                    4,
+                    "m",
+                    Type::Map(MapType::new(
+                        NestedField::map_key_element(
+                            5,
+                            Type::Primitive(PrimitiveType::String),
+                        )
+                        .into(),
+                        NestedField::map_value_element(6, variant(), false).into(),
+                    )),
+                )
+                .into(),
+            ])
+            .build()
+            .unwrap();
+
+        let storage = || {
+            DataType::Struct(Fields::from(vec![
+                Field::new("metadata", DataType::Binary, false),
+                Field::new("value", DataType::Binary, true),
+            ]))
+        };
+        let entries = Fields::from(vec![
+            Field::new(MAP_KEY_FIELD_NAME, DataType::Utf8, false),
+            Field::new(MAP_VALUE_FIELD_NAME, storage(), true),
+        ]);
+        let entries =
+            Field::new(DEFAULT_MAP_FIELD_NAME, DataType::Struct(entries), false);
+        let expected = ArrowSchema::new(vec![
+            Field::new("v", storage(), true),
+            Field::new(
+                "l",
+                DataType::List(Arc::new(Field::new(
+                    LIST_FIELD_NAME,
+                    storage(),
+                    true,
+                ))),
+                true,
+            ),
+            Field::new("m", DataType::Map(Arc::new(entries), false), true),
+        ]);
+
+        pretty_assertions::assert_eq!(
+            strip_metadata_from_schema(&schema_to_arrow_schema(&schema).unwrap())
+                .unwrap(),
+            expected
+        );
+    }
+
+    /// A dictionary-encoded field compares equal to a plain field of its value
+    /// type once stripped, at any depth.
+    #[test]
+    fn test_strip_metadata_unwraps_dictionaries() {
+        let schema = |dictionary_encoded: bool| {
+            let maybe_dictionary = |key: DataType, value: DataType| {
+                if dictionary_encoded {
+                    DataType::Dictionary(Box::new(key), Box::new(value))
+                } else {
+                    value
+                }
+            };
+            let element = Field::new(
+                LIST_FIELD_NAME,
+                maybe_dictionary(DataType::Int8, DataType::LargeUtf8),
+                false,
+            );
+            ArrowSchema::new(vec![
+                Field::new(
+                    "d",
+                    maybe_dictionary(DataType::Int32, DataType::Utf8),
+                    true,
+                ),
+                Field::new("l", DataType::List(Arc::new(element)), true),
+            ])
+        };
+
+        pretty_assertions::assert_eq!(
+            strip_metadata_from_schema(&schema(true)).unwrap(),
+            schema(false)
+        );
+    }
+
+    mod local_regressions {
+        use super::*;
+
+        #[test]
+        fn test_arrow_schema_to_schema_auto_assign_ids() {
+            let arrow_schema = ArrowSchema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new(
+                    "tags",
+                    DataType::List(Arc::new(Field::new(
+                        "item",
+                        DataType::Utf8,
+                        true,
+                    ))),
+                    true,
+                ),
+                Field::new(
+                    "address",
+                    DataType::Struct(Fields::from(vec![
+                        Field::new("street", DataType::Utf8, true),
+                        Field::new("city", DataType::Utf8, false),
+                    ])),
+                    true,
+                ),
+                Field::new(
+                    "attributes",
+                    DataType::Map(
+                        Arc::new(Field::new(
+                            DEFAULT_MAP_FIELD_NAME,
+                            DataType::Struct(Fields::from(vec![
+                                Field::new("key", DataType::Utf8, false),
+                                Field::new("value", DataType::Utf8, true),
+                            ])),
+                            false,
+                        )),
+                        false,
+                    ),
+                    true,
+                ),
+            ]);
+
+            let schema =
+                arrow_schema_to_schema_auto_assign_ids(&arrow_schema).unwrap();
+            let expected = Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(
+                        1,
+                        "id",
+                        Type::Primitive(PrimitiveType::Long),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        2,
+                        "tags",
+                        Type::List(ListType {
+                            element_field: NestedField::list_element(
+                                5,
+                                Type::Primitive(PrimitiveType::String),
+                                false,
+                            )
+                            .into(),
+                        }),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        3,
+                        "address",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(
+                                6,
+                                "street",
+                                Type::Primitive(PrimitiveType::String),
+                            )
+                            .into(),
+                            NestedField::required(
+                                7,
+                                "city",
+                                Type::Primitive(PrimitiveType::String),
+                            )
+                            .into(),
+                        ])),
+                    )
+                    .into(),
+                    NestedField::optional(
+                        4,
+                        "attributes",
+                        Type::Map(MapType {
+                            key_field: NestedField::map_key_element(
+                                8,
+                                Type::Primitive(PrimitiveType::String),
+                            )
+                            .into(),
+                            value_field: NestedField::map_value_element(
+                                9,
+                                Type::Primitive(PrimitiveType::String),
+                                false,
+                            )
+                            .into(),
+                        }),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap();
+
+            pretty_assertions::assert_eq!(schema, expected);
+            assert_eq!(schema.highest_field_id(), 9);
         }
     }
 }

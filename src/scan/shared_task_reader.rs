@@ -66,8 +66,8 @@ impl TableScan {
 mod tests {
     use super::*;
     use crate::expr::Reference;
-    use crate::scan::tests::TableTestFixture;
     use crate::spec::Datum;
+    use crate::test_utils::scan::TableTestFixture;
 
     #[test]
     fn shared_task_paths_honor_case_sensitivity_and_bloom_filter_setting() {

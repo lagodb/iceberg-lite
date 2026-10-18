@@ -24,8 +24,9 @@ use arrow_select::filter::filter_record_batch;
 
 use super::arrow_struct_to_literal;
 use super::partition_value_calculator::PartitionValueCalculator;
+use crate::Result;
+use crate::error::invalid_data;
 use crate::spec::{Literal, PartitionKey, PartitionSpecRef, SchemaRef, StructType};
-use crate::{Error, ErrorKind, Result};
 
 /// Column name for the projected partition values struct
 pub const PROJECTED_PARTITION_VALUE_COLUMN: &str = "_partition";
@@ -134,9 +135,8 @@ impl RecordBatchPartitionSplitter {
                     if let Some(Literal::Struct(s)) = s {
                         Ok(s)
                     } else {
-                        Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            "Partition value is not a struct literal or is null",
+                        Err(invalid_data!(
+                            "Partition value is not a struct literal or is null"
                         ))
                     }
                 })
@@ -146,11 +146,8 @@ impl RecordBatchPartitionSplitter {
             let partition_column = batch
                 .column_by_name(PROJECTED_PARTITION_VALUE_COLUMN)
                 .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
+                    invalid_data!(
                             "Partition column '{PROJECTED_PARTITION_VALUE_COLUMN}' not found in batch"
-                        ),
                     )
                 })?;
 
@@ -158,10 +155,7 @@ impl RecordBatchPartitionSplitter {
                 .as_any()
                 .downcast_ref::<StructArray>()
                 .ok_or_else(|| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        "Partition column is not a StructArray",
-                    )
+                    invalid_data!("Partition column is not a StructArray")
                 })?;
 
             let arrow_struct_array =
@@ -175,9 +169,8 @@ impl RecordBatchPartitionSplitter {
                     if let Some(Literal::Struct(s)) = s {
                         Ok(s)
                     } else {
-                        Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            "Partition value is not a struct literal or is null",
+                        Err(invalid_data!(
+                            "Partition value is not a struct literal or is null"
                         ))
                     }
                 })
@@ -261,12 +254,14 @@ mod tests {
         let partition_spec = Arc::new(
             PartitionSpecBuilder::new(schema.clone())
                 .with_spec_id(1)
-                .add_unbound_field(UnboundPartitionField {
-                    source_id: 1,
-                    field_id: None,
-                    name: "id_bucket".to_string(),
-                    transform: Transform::Identity,
-                })
+                .add_unbound_field(
+                    UnboundPartitionField::builder()
+                        .source_ids(vec![1])
+                        .name("id_bucket".to_string())
+                        .transform(Transform::Identity)
+                        .build()
+                        .unwrap(),
+                )
                 .unwrap()
                 .build()
                 .unwrap(),
@@ -379,12 +374,14 @@ mod tests {
         let partition_spec = Arc::new(
             PartitionSpecBuilder::new(schema.clone())
                 .with_spec_id(1)
-                .add_unbound_field(UnboundPartitionField {
-                    source_id: 1,
-                    field_id: None,
-                    name: "id_bucket".to_string(),
-                    transform: Transform::Identity,
-                })
+                .add_unbound_field(
+                    UnboundPartitionField::builder()
+                        .source_ids(vec![1])
+                        .name("id_bucket".to_string())
+                        .transform(Transform::Identity)
+                        .build()
+                        .unwrap(),
+                )
                 .unwrap()
                 .build()
                 .unwrap(),

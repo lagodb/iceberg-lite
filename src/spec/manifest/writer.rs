@@ -26,15 +26,14 @@ use super::{
     UNASSIGNED_SEQUENCE_NUMBER,
 };
 use crate::encryption::EncryptedOutputFile;
-use crate::error::Result;
-use crate::io::OutputFile;
+use crate::error::{Result, invalid_data};
+use crate::io::{FileMetadata, OutputFile};
 use crate::spec::manifest::_serde::{ManifestEntryV1, ManifestEntryV2};
 use crate::spec::manifest::{manifest_schema_v1, manifest_schema_v2};
 use crate::spec::{
     DataContentType, DataFile, FieldSummary, ManifestEntry, ManifestFile,
     ManifestMetadata, ManifestStatus, PrimitiveLiteral, SchemaRef, StructType, Type,
 };
-use crate::{Error, ErrorKind};
 
 /// Placeholder for snapshot ID. The field with this value must be replaced
 /// with the actual snapshot ID before it is committed.
@@ -53,9 +52,14 @@ impl ManifestWriterOutput {
         }
     }
 
-    fn write(&self, content: &[u8]) -> Result<()> {
+    fn write(&self, content: &[u8]) -> Result<FileMetadata> {
         match self {
-            Self::Plain(output) => output.write(content),
+            Self::Plain(output) => {
+                output.write(content)?;
+                Ok(FileMetadata {
+                    size: content.len() as u64,
+                })
+            }
             Self::Encrypted(output) => {
                 output.write(bytes::Bytes::copy_from_slice(content))
             }
@@ -67,7 +71,6 @@ impl ManifestWriterOutput {
 pub struct ManifestWriterBuilder {
     output: ManifestWriterOutput,
     snapshot_id: Option<i64>,
-    key_metadata: Option<Vec<u8>>,
     schema: SchemaRef,
     partition_spec: PartitionSpec,
 }
@@ -83,7 +86,6 @@ impl ManifestWriterBuilder {
         Self {
             output: ManifestWriterOutput::Plain(output),
             snapshot_id,
-            key_metadata: None,
             schema,
             partition_spec,
         }
@@ -96,11 +98,9 @@ impl ManifestWriterBuilder {
         schema: SchemaRef,
         partition_spec: PartitionSpec,
     ) -> Result<Self> {
-        let key_metadata = Some(encrypted_output.key_metadata().encode()?.into_vec());
         Ok(Self {
             output: ManifestWriterOutput::Encrypted(encrypted_output),
             snapshot_id,
-            key_metadata,
             schema,
             partition_spec,
         })
@@ -115,13 +115,7 @@ impl ManifestWriterBuilder {
             .format_version(FormatVersion::V1)
             .content(ManifestContentType::Data)
             .build();
-        ManifestWriter::new_with_output(
-            self.output,
-            self.snapshot_id,
-            self.key_metadata,
-            metadata,
-            None,
-        )
+        ManifestWriter::new_with_output(self.output, self.snapshot_id, metadata, None)
     }
 
     /// Build a [`ManifestWriter`] for format version 2, data content.
@@ -133,13 +127,7 @@ impl ManifestWriterBuilder {
             .format_version(FormatVersion::V2)
             .content(ManifestContentType::Data)
             .build();
-        ManifestWriter::new_with_output(
-            self.output,
-            self.snapshot_id,
-            self.key_metadata,
-            metadata,
-            None,
-        )
+        ManifestWriter::new_with_output(self.output, self.snapshot_id, metadata, None)
     }
 
     /// Build a [`ManifestWriter`] for format version 2, deletes content.
@@ -151,13 +139,7 @@ impl ManifestWriterBuilder {
             .format_version(FormatVersion::V2)
             .content(ManifestContentType::Deletes)
             .build();
-        ManifestWriter::new_with_output(
-            self.output,
-            self.snapshot_id,
-            self.key_metadata,
-            metadata,
-            None,
-        )
+        ManifestWriter::new_with_output(self.output, self.snapshot_id, metadata, None)
     }
 
     /// Build a [`ManifestWriter`] for format version 2, data content.
@@ -172,7 +154,6 @@ impl ManifestWriterBuilder {
         ManifestWriter::new_with_output(
             self.output,
             self.snapshot_id,
-            self.key_metadata,
             metadata,
             // First row id is assigned by the [`ManifestListWriter`] when the manifest
             // is added to the list.
@@ -189,13 +170,7 @@ impl ManifestWriterBuilder {
             .format_version(FormatVersion::V3)
             .content(ManifestContentType::Deletes)
             .build();
-        ManifestWriter::new_with_output(
-            self.output,
-            self.snapshot_id,
-            self.key_metadata,
-            metadata,
-            None,
-        )
+        ManifestWriter::new_with_output(self.output, self.snapshot_id, metadata, None)
     }
 }
 
@@ -215,8 +190,6 @@ pub struct ManifestWriter {
 
     min_seq_num: Option<i64>,
 
-    key_metadata: Option<Vec<u8>>,
-
     manifest_entries: Vec<ManifestEntry>,
 
     metadata: ManifestMetadata,
@@ -226,7 +199,6 @@ impl ManifestWriter {
     fn new_with_output(
         output: ManifestWriterOutput,
         snapshot_id: Option<i64>,
-        key_metadata: Option<Vec<u8>>,
         metadata: ManifestMetadata,
         first_row_id: Option<u64>,
     ) -> Self {
@@ -241,7 +213,6 @@ impl ManifestWriter {
             deleted_rows: 0,
             first_row_id,
             min_seq_num: None,
-            key_metadata,
             manifest_entries: Vec::new(),
             metadata,
         }
@@ -275,13 +246,10 @@ impl ManifestWriter {
         match self.metadata.content {
             ManifestContentType::Data => {
                 if data_file.content != DataContentType::Data {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Date file at path {} with manifest content type `data`, should have DataContentType `Data`, but has `{:?}`",
-                            data_file.file_path(),
-                            data_file.content
-                        ),
+                    return Err(invalid_data!(
+                        "Date file at path {} with manifest content type `data`, should have DataContentType `Data`, but has `{:?}`",
+                        data_file.file_path(),
+                        data_file.content
                     ));
                 }
             }
@@ -289,13 +257,10 @@ impl ManifestWriter {
                 if data_file.content != DataContentType::EqualityDeletes
                     && data_file.content != DataContentType::PositionDeletes
                 {
-                    return Err(Error::new(
-                        ErrorKind::DataInvalid,
-                        format!(
-                            "Date file at path {} with manifest content type `deletes`, should have DataContentType `Data`, but has `{:?}`",
-                            data_file.file_path(),
-                            data_file.content
-                        ),
+                    return Err(invalid_data!(
+                        "Date file at path {} with manifest content type `deletes`, should have DataContentType `Data`, but has `{:?}`",
+                        data_file.file_path(),
+                        data_file.content
                     ));
                 }
             }
@@ -440,9 +405,8 @@ impl ManifestWriter {
             && (entry.sequence_number.is_none()
                 || entry.file_sequence_number.is_none())
         {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "Manifest entry with status Existing or Deleted should have sequence number",
+            return Err(invalid_data!(
+                "Manifest entry with status Existing or Deleted should have sequence number"
             ));
         }
 
@@ -487,12 +451,11 @@ impl ManifestWriter {
                 manifest_schema_v2(&partition_type)?
             }
         };
-        let mut avro_writer = AvroWriter::new(&avro_schema, Vec::new());
+        let mut avro_writer = AvroWriter::new(&avro_schema, Vec::new())?;
         avro_writer.add_user_metadata(
             "schema".to_string(),
             to_vec(table_schema).map_err(|err| {
-                Error::new(ErrorKind::DataInvalid, "Fail to serialize table schema")
-                    .with_source(err)
+                invalid_data!("Fail to serialize table schema").with_source(err)
             })?,
         )?;
         avro_writer.add_user_metadata(
@@ -502,8 +465,7 @@ impl ManifestWriter {
         avro_writer.add_user_metadata(
             "partition-spec".to_string(),
             to_vec(&self.metadata.partition_spec.fields()).map_err(|err| {
-                Error::new(ErrorKind::DataInvalid, "Fail to serialize partition spec")
-                    .with_source(err)
+                invalid_data!("Fail to serialize partition spec").with_source(err)
             })?,
         )?;
         avro_writer.add_user_metadata(
@@ -541,16 +503,24 @@ impl ManifestWriter {
                 .resolve(&avro_schema)?,
             };
 
-            avro_writer.append(value)?;
+            avro_writer.append_value(value)?;
         }
 
         let content = avro_writer.into_inner()?;
-        let length = content.len();
-        self.output.write(&content)?;
+        let file_metadata = self.output.write(&content)?;
+        let key_metadata = match &self.output {
+            ManifestWriterOutput::Plain(_) => None,
+            ManifestWriterOutput::Encrypted(output) => Some(
+                output
+                    .key_metadata_with_saved_file_metadata(&file_metadata)
+                    .encode()?
+                    .into_vec(),
+            ),
+        };
 
         Ok(ManifestFile {
             manifest_path: self.output.location().to_string(),
-            manifest_length: length as i64,
+            manifest_length: file_metadata.size as i64,
             partition_spec_id: self.metadata.partition_spec.spec_id(),
             content: self.metadata.content,
             // sequence_number and min_sequence_number with UNASSIGNED_SEQUENCE_NUMBER will be replace with
@@ -567,7 +537,7 @@ impl ManifestWriter {
             existing_rows_count: Some(self.existing_rows),
             deleted_rows_count: Some(self.deleted_rows),
             partitions: Some(partition_summary),
-            key_metadata: self.key_metadata,
+            key_metadata,
             first_row_id: self.first_row_id,
         })
     }
@@ -599,10 +569,7 @@ impl PartitionFieldStats {
             return Ok(());
         };
         if !self.partition_type.compatible(&value) {
-            return Err(Error::new(
-                ErrorKind::DataInvalid,
-                "value is not compatible with type",
-            ));
+            return Err(invalid_data!("value is not compatible with type"));
         }
         let value = Datum::new(self.partition_type.clone(), value);
 
@@ -646,9 +613,11 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
+    use crate::avro::define_named_types_repeatedly;
     use crate::io::FileIO;
     use crate::spec::{
-        DataFileFormat, Manifest, NestedField, PrimitiveType, Schema, Struct, Type,
+        DataContentType, DataFileBuilder, DataFileFormat, Literal, Manifest,
+        NestedField, PrimitiveType, Schema, Struct, Transform, Type,
     };
 
     #[test]
@@ -799,5 +768,99 @@ mod tests {
         // file sequence number is assigned to None when the entry is added and delete to the manifest.
         entries[0].file_sequence_number = None;
         assert_eq!(actual_manifest, Manifest::new(metadata, entries));
+    }
+    fn roundtrip_two_partition_fields_of_type(
+        field_type: Type,
+        values: [Literal; 2],
+    ) -> Vec<u8> {
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::optional(1, "a", field_type.clone()).into(),
+                    NestedField::optional(2, "b", field_type).into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let partition_spec = PartitionSpec::builder(schema.clone())
+            .with_spec_id(0)
+            .add_partition_field("a", "a", Transform::Identity)
+            .unwrap()
+            .add_partition_field("b", "b", Transform::Identity)
+            .unwrap()
+            .build()
+            .unwrap();
+        let partition = Struct::from_iter(values.map(Some));
+        let tmp_dir = TempDir::new().unwrap();
+        let path = tmp_dir.path().join("manifest.avro");
+        let output_file = FileIO::local().new_output(path.to_str().unwrap()).unwrap();
+        let mut writer =
+            ManifestWriterBuilder::new(output_file, Some(1), schema, partition_spec)
+                .build_v2_data();
+        writer
+            .add_file(
+                DataFileBuilder::default()
+                    .content(DataContentType::Data)
+                    .file_path("s3://bucket/table/data/a.parquet".to_string())
+                    .file_format(DataFileFormat::Parquet)
+                    .partition(partition.clone())
+                    .record_count(1)
+                    .file_size_in_bytes(1)
+                    .partition_spec_id(0)
+                    .build()
+                    .unwrap(),
+                1,
+            )
+            .unwrap();
+        writer.write_manifest_file().unwrap();
+        let bs = fs::read(&path).unwrap();
+
+        // Also read the manifest as iceberg-rust wrote it before defining each
+        // named type once.
+        for bs in [bs.clone(), define_named_types_repeatedly(&bs)] {
+            let manifest = Manifest::parse_avro(&bs).unwrap();
+
+            assert_eq!(*manifest.entries()[0].data_file().partition(), partition);
+        }
+        bs
+    }
+
+    #[test]
+    fn test_write_manifest_header_marks_int_keyed_maps() {
+        // Java and PyIceberg read an array of key-value records as a map only if
+        // it has `logicalType: map`. apache-avro 0.22 drops the attribute when it
+        // parses a schema (https://github.com/apache/avro-rs/issues/654), so this
+        // checks the schema JSON in the written header.
+        let bs = roundtrip_two_partition_fields_of_type(
+            Type::Primitive(PrimitiveType::Int),
+            [Literal::int(1), Literal::int(2)],
+        );
+
+        let file = String::from_utf8_lossy(&bs);
+        // `column_sizes`, `value_counts`, `null_value_counts`,
+        // `nan_value_counts`, `lower_bounds`, and `upper_bounds`.
+        assert_eq!(file.matches(r#""logicalType":"map""#).count(), 6);
+    }
+
+    #[test]
+    fn test_write_manifest_with_repeated_decimal_partition_type() {
+        roundtrip_two_partition_fields_of_type(
+            Type::Primitive(PrimitiveType::Decimal {
+                precision: 10,
+                scale: 2,
+            }),
+            [Literal::decimal(12345), Literal::decimal(-678)],
+        );
+    }
+
+    #[test]
+    fn test_write_manifest_with_repeated_fixed_partition_type() {
+        roundtrip_two_partition_fields_of_type(
+            Type::Primitive(PrimitiveType::Fixed(4)),
+            [
+                Literal::fixed(vec![1, 2, 3, 4]),
+                Literal::fixed(vec![5, 6, 7, 8]),
+            ],
+        );
     }
 }
