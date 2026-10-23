@@ -1,3 +1,5 @@
+mod publication;
+
 use std::collections::HashMap;
 
 use http::StatusCode;
@@ -9,7 +11,7 @@ use crate::table::Table;
 use crate::transaction::PreparedTableCommit;
 use crate::{
     Catalog, ErrorKind, NamespaceIdent, TableCommit, TableCreation, TableIdent,
-    TableUpdate,
+    TableRequirement, TableUpdate,
 };
 
 const CREATE_TABLE_RESPONSE: &str =
@@ -287,7 +289,7 @@ fn create_table_serializes_the_request_and_builds_table_storage() {
                 "location": "s3://warehouse/custom/test1",
                 "schema": table_schema(),
                 "stage-create": false,
-                "properties": {"owner": "test"}
+                "properties": {"format-version": "3", "owner": "test"}
             }))
             .respond(StatusCode::OK, CREATE_TABLE_RESPONSE),
     );
@@ -297,6 +299,7 @@ fn create_table_serializes_the_request_and_builds_table_storage() {
         .location("s3://warehouse/custom/test1".to_owned())
         .schema(table_schema())
         .properties(HashMap::from([("owner".to_owned(), "test".to_owned())]))
+        .format_version(FormatVersion::V3)
         .build();
 
     let table = catalog
@@ -548,13 +551,18 @@ fn update_statuses_preserve_commit_semantics() {
 fn prepared_transaction_preserves_each_table_requirements_and_updates() {
     let fixture = RestTestFixture::default();
     fixture.expect_config(serde_json::json!({"defaults": {}, "overrides": {}}));
+    let first_table = transaction_table(&fixture, table_ident("test1"));
+    let table_uuid = first_table.metadata().uuid();
+    let second_table = transaction_table(&fixture, table_ident("test2"));
     fixture.expect(
         ExpectedExchange::post(format!("{CATALOG_URI}/v1/transactions/commit"))
             .json_body(serde_json::json!({
                 "table-changes": [
                     {
                         "identifier": {"namespace": ["ns1"], "name": "test1"},
-                        "requirements": [],
+                        "requirements": [
+                            {"type": "assert-table-uuid", "uuid": table_uuid}
+                        ],
                         "updates": [
                             {"action": "upgrade-format-version", "format-version": 2}
                         ]
@@ -571,20 +579,20 @@ fn prepared_transaction_preserves_each_table_requirements_and_updates() {
     let catalog = fixture.bound_catalog([]);
     let prepared = [
         (
-            table_ident("test1"),
+            first_table,
+            vec![TableRequirement::UuidMatch { uuid: table_uuid }],
             vec![TableUpdate::UpgradeFormatVersion {
                 format_version: FormatVersion::V2,
             }],
         ),
-        (table_ident("test2"), Vec::new()),
+        (second_table, Vec::new(), Vec::new()),
     ]
     .into_iter()
-    .map(|(identifier, updates)| {
-        let table = transaction_table(&fixture, identifier.clone());
+    .map(|(table, requirements, updates)| {
         let commit = TableCommit::builder()
-            .ident(identifier)
+            .ident(table.identifier().clone())
             .file_io(fixture.file_io())
-            .requirements(Vec::new())
+            .requirements(requirements)
             .updates(updates)
             .build();
         PreparedTableCommit::new(table, commit)

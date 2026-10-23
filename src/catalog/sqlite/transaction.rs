@@ -17,6 +17,7 @@
 
 use rusqlite::params;
 
+use crate::catalog::MetadataLocation;
 use crate::table::Table;
 use crate::transaction::PreparedTableCommit;
 use crate::{Catalog, Error, ErrorKind, Result, TableCommit, TableIdent};
@@ -31,15 +32,22 @@ use super::SqliteCatalog;
 #[must_use = "a prepared SQLite commit must be published to update catalog pointers"]
 pub struct PreparedSqliteCommit {
     catalog: SqliteCatalog,
-    updates: Vec<SqliteTableUpdate>,
+    changes: Vec<SqliteTableChange>,
 }
 
 #[derive(Debug)]
-pub(super) struct SqliteTableUpdate {
-    identifier: TableIdent,
-    namespace: String,
-    previous: String,
-    next: String,
+pub(super) enum SqliteTableChange {
+    Create {
+        identifier: TableIdent,
+        namespace: String,
+        next: String,
+    },
+    Update {
+        identifier: TableIdent,
+        namespace: String,
+        previous: String,
+        next: String,
+    },
 }
 
 impl SqliteCatalog {
@@ -55,19 +63,40 @@ impl SqliteCatalog {
                 "SQLite transaction requires a table change",
             ));
         }
-        let mut updates = Vec::with_capacity(commits.len());
+        let mut changes = Vec::with_capacity(commits.len());
         for prepared in commits {
-            let (_, commit) = prepared.into_parts();
-            let (_, update) = self.prepare_update(commit)?;
-            updates.push(update);
+            if prepared.is_create() {
+                changes.push(self.prepare_create(prepared)?);
+            } else {
+                let (_, commit) = prepared.into_parts();
+                let (_, update) = self.prepare_update(commit)?;
+                changes.push(update);
+            }
         }
-        Ok(PreparedSqliteCommit::new(self.clone(), updates))
+        Ok(PreparedSqliteCommit::new(self.clone(), changes))
+    }
+
+    fn prepare_create(
+        &self,
+        prepared: PreparedTableCommit,
+    ) -> Result<SqliteTableChange> {
+        let (table, _) = prepared.into_parts();
+        let identifier = table.identifier().clone();
+        let namespace = Self::namespace_key(identifier.namespace())?;
+        let next =
+            MetadataLocation::try_new_with_metadata(table.metadata())?.to_string();
+        table.metadata().write_to(table.file_io(), &next)?;
+        Ok(SqliteTableChange::Create {
+            identifier,
+            namespace,
+            next,
+        })
     }
 
     pub(super) fn prepare_update(
         &self,
         commit: TableCommit,
-    ) -> Result<(Table, SqliteTableUpdate)> {
+    ) -> Result<(Table, SqliteTableChange)> {
         // Preserve upstream update_table's load/apply/write/CAS sequence.
         let identifier = commit.identifier().clone();
         let current = self.load_table(&identifier)?;
@@ -78,7 +107,7 @@ impl SqliteCatalog {
         let namespace = Self::namespace_key(identifier.namespace())?;
         Ok((
             staged,
-            SqliteTableUpdate {
+            SqliteTableChange::Update {
                 identifier,
                 namespace,
                 previous,
@@ -91,9 +120,9 @@ impl SqliteCatalog {
 impl PreparedSqliteCommit {
     pub(super) fn new(
         catalog: SqliteCatalog,
-        updates: Vec<SqliteTableUpdate>,
+        changes: Vec<SqliteTableChange>,
     ) -> Self {
-        Self { catalog, updates }
+        Self { catalog, changes }
     }
 
     /// Publishes all table changes atomically. A conflict rolls back the batch.
@@ -101,19 +130,39 @@ impl PreparedSqliteCommit {
     pub fn publish(self) -> Result<()> {
         let mut connection = self.catalog.connection()?;
         let tx = connection.transaction()?;
-        for update in self.updates {
-            let changed = tx.execute(
-                "UPDATE iceberg_tables SET metadata_location = ?1, previous_metadata_location = ?2
-                 WHERE catalog_name = ?3 AND table_namespace = ?4 AND table_name = ?5
-                 AND (iceberg_type = 'TABLE' OR iceberg_type IS NULL) AND metadata_location = ?2",
-                params![update.next, update.previous, self.catalog.name(), update.namespace, update.identifier.name()],
-            )?;
-            if changed == 0 {
-                return Err(Error::new(
-                    ErrorKind::CatalogCommitConflicts,
-                    format!("Commit conflicted for table: {}", update.identifier),
-                )
-                .with_retryable(true));
+        for change in self.changes {
+            match change {
+                SqliteTableChange::Create {
+                    identifier,
+                    namespace,
+                    next,
+                } => {
+                    // The schema has no foreign key, so recheck in the same
+                    // transaction that publishes the table pointer.
+                    self.catalog.require_namespace(&tx, &namespace)?;
+                    self.catalog
+                        .insert_table(&tx, &namespace, &identifier, &next)?;
+                }
+                SqliteTableChange::Update {
+                    identifier,
+                    namespace,
+                    previous,
+                    next,
+                } => {
+                    let changed = tx.execute(
+                        "UPDATE iceberg_tables SET metadata_location = ?1, previous_metadata_location = ?2
+                         WHERE catalog_name = ?3 AND table_namespace = ?4 AND table_name = ?5
+                         AND (iceberg_type = 'TABLE' OR iceberg_type IS NULL) AND metadata_location = ?2",
+                        params![next, previous, self.catalog.name(), namespace, identifier.name()],
+                    )?;
+                    if changed == 0 {
+                        return Err(Error::new(
+                            ErrorKind::CatalogCommitConflicts,
+                            format!("Commit conflicted for table: {identifier}"),
+                        )
+                        .with_retryable(true));
+                    }
+                }
             }
         }
         tx.commit()?;

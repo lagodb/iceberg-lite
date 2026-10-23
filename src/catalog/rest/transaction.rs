@@ -15,13 +15,13 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//! Owned REST transaction requests prepared before catalog publication.
+//! Owned REST commit requests prepared before catalog publication.
 
 use std::fmt::{Debug, Formatter};
 
 use super::request::HttpRequest;
 
-/// A serialized REST transaction request ready for transport.
+/// A serialized REST commit request ready for transport.
 ///
 /// The request owns its URL, headers and JSON body. Sending it does not need
 /// to revisit table metadata or serialize Iceberg requirements and updates.
@@ -38,7 +38,7 @@ impl PreparedRestCommit {
         }
     }
 
-    /// Returns the number of table changes in the atomic catalog request.
+    /// Returns the number of table changes in the catalog request.
     pub const fn table_count(&self) -> usize {
         self.table_count
     }

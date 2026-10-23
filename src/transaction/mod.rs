@@ -17,7 +17,8 @@
 
 //! This module contains transaction api.
 //!
-//! The transaction API enables changes to be made to an existing table.
+//! The transaction API enables changes to be made to a published table or a
+//! table initialized for staged creation.
 //!
 //! Note that this may also have side effects, such as producing new manifest
 //! files.
@@ -56,12 +57,14 @@ mod append;
 mod expire_snapshots;
 mod manifest_rewrite;
 mod prepared;
+mod replay;
 mod rewrite_files;
 mod rewrite_manifests;
 mod row_delta;
 mod snapshot;
 mod snapshot_delta;
 mod sort_order;
+mod staged_create;
 mod update_location;
 mod update_properties;
 mod update_schema;
@@ -72,13 +75,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use backon::{BackoffBuilder, ExponentialBackoff, ExponentialBuilder};
+use prepared::TableCommitKind;
 pub use prepared::{PreparedTableCommit, PreparedTransaction};
+pub use staged_create::StagedTableCreate;
 pub use update_schema::{AddColumn, PreparedSchemaUpdate};
 
 use crate::error::Result;
 use crate::overlay::SnapshotDelta;
 pub use crate::spec::IsolationLevel;
-use crate::spec::TableProperties;
+use crate::spec::{TableMetadata, TableProperties};
 use crate::table::Table;
 use crate::transaction::action::TransactionActionEntry;
 use crate::transaction::append::FastAppendAction;
@@ -95,12 +100,18 @@ use crate::transaction::update_properties::UpdatePropertiesAction;
 use crate::transaction::update_schema::UpdateSchemaAction;
 use crate::transaction::update_statistics::UpdateStatisticsAction;
 use crate::transaction::upgrade_format_version::UpgradeFormatVersionAction;
-use crate::{Catalog, TableCommit, TableRequirement, TableUpdate};
+use crate::{Catalog, Error, ErrorKind, TableRequirement, TableUpdate};
+
+enum TransactionOrigin {
+    Published,
+    StagedCreate { initial_updates: Vec<TableUpdate> },
+}
 
 /// Table transaction.
 pub struct Transaction {
     table: Table,
     actions: Vec<TransactionActionEntry>,
+    origin: TransactionOrigin,
 }
 
 impl Transaction {
@@ -109,6 +120,7 @@ impl Transaction {
         Self {
             table: table.clone(),
             actions: vec![],
+            origin: TransactionOrigin::Published,
         }
     }
 
@@ -127,7 +139,8 @@ impl Transaction {
     fn apply(
         table: Table,
         mut action_commit: ActionCommit,
-        base_metadata: &crate::spec::TableMetadata,
+        base_metadata: &TableMetadata,
+        kind: TableCommitKind,
         existing_updates: &mut Vec<TableUpdate>,
         existing_requirements: &mut Vec<TableRequirement>,
     ) -> Result<Table> {
@@ -141,11 +154,11 @@ impl Transaction {
         let updated_table = Self::update_table_metadata(table, &updates)?;
 
         existing_updates.extend(updates);
-        existing_requirements.extend(
-            requirements
-                .into_iter()
-                .filter(|requirement| requirement.check(Some(base_metadata)).is_ok()),
-        );
+        if kind == TableCommitKind::Update {
+            existing_requirements.extend(requirements.into_iter().filter(
+                |requirement| requirement.check(Some(base_metadata)).is_ok(),
+            ));
+        }
 
         Ok(updated_table)
     }
@@ -218,8 +231,17 @@ impl Transaction {
         RewriteFilesAction::new(starting_snapshot_id, starting_sequence_number)
     }
 
-    /// Commit transaction.
+    /// Commit a transaction on a published table.
+    ///
+    /// Staged creates must use [`Self::prepare`] and a catalog-specific
+    /// prepared publication API.
     pub fn commit(mut self, catalog: &dyn Catalog) -> Result<Table> {
+        if matches!(&self.origin, TransactionOrigin::StagedCreate { .. }) {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                "staged table creation must be prepared and published by its catalog",
+            ));
+        }
         if self.actions.is_empty() {
             // nothing to commit
             return Ok(self.table);
@@ -268,65 +290,55 @@ impl Transaction {
             .build())
     }
 
-    /// Materializes every action against a freshly loaded table without
-    /// publishing the resulting catalog update.
+    /// Materializes every action without publishing the catalog update.
+    /// Published tables are refreshed first; staged creates use the
+    /// catalog-initialized transaction-local table.
     ///
     /// Unlike [`Self::commit`], this method deliberately performs no retry:
     /// once publication is separated from preparation, a caller cannot safely
     /// rebase the same prepared artifacts after a later catalog conflict.
     pub fn prepare(mut self, catalog: &dyn Catalog) -> Result<PreparedTransaction> {
-        if self.actions.is_empty() {
-            return Ok(PreparedTransaction::Noop(self.table));
+        match self.origin {
+            TransactionOrigin::Published => {
+                if self.actions.is_empty() {
+                    return Ok(PreparedTransaction::Noop(self.table));
+                }
+                self.prepare_once(catalog)
+            }
+            origin @ TransactionOrigin::StagedCreate { .. } => {
+                Self::replay_actions(&self.table, &mut self.actions, origin)
+            }
         }
-        self.prepare_once(catalog)
     }
 
     fn prepare_once(&mut self, catalog: &dyn Catalog) -> Result<PreparedTransaction> {
         let refreshed = catalog.load_table(self.table.identifier())?;
 
+        // A same-name replacement is a different table, not a new commit base.
+        // Reject it before rebasing or replaying actions, including on retries.
+        TableRequirement::UuidMatch {
+            uuid: self.table.metadata().uuid(),
+        }
+        .check(Some(refreshed.metadata()))
+        .map_err(|error| error.with_retryable(false))?;
+
         // Always retain the refreshed table, even when metadata is unchanged:
         // catalog responses may refresh response-scoped storage credentials.
         self.table = refreshed;
 
-        let mut current_table = self.table.clone();
-        let mut existing_updates: Vec<TableUpdate> = vec![];
-        let mut existing_requirements: Vec<TableRequirement> = vec![];
-
-        for entry in self.actions.iter_mut() {
-            let action_commit = entry.commit(&current_table)?;
-            if action_commit.is_empty() {
-                continue;
-            }
-            // apply action commit to current_table
-            current_table = Self::apply(
-                current_table,
-                action_commit,
-                self.table.metadata(),
-                &mut existing_updates,
-                &mut existing_requirements,
-            )?;
-        }
-
-        if existing_updates.is_empty() && existing_requirements.is_empty() {
-            return Ok(PreparedTransaction::Noop(current_table));
-        }
-
-        let table_commit = TableCommit::builder()
-            .ident(self.table.identifier().to_owned())
-            .file_io(self.table.file_io().clone())
-            .updates(existing_updates)
-            .requirements(existing_requirements)
-            .build();
-
-        Ok(PreparedTransaction::Commit(PreparedTableCommit::new(
-            current_table,
-            table_commit,
-        )))
+        Self::replay_actions(
+            &self.table,
+            &mut self.actions,
+            TransactionOrigin::Published,
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
+    mod refresh;
+    mod replay;
+
     use std::collections::HashMap;
     use std::fs::File;
     use std::io::BufReader;

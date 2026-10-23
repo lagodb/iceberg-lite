@@ -17,6 +17,8 @@
 
 //! This module contains the iceberg REST catalog implementation.
 
+mod staged_create;
+
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
@@ -32,7 +34,7 @@ use url::Url;
 use crate::encryption::kms::{KeyManagementClient, KmsClientFactory};
 use crate::io::{FileIO, StorageConfig, StorageCredential, StorageFactory};
 use crate::table::Table;
-use crate::transaction::PreparedTableCommit;
+use crate::transaction::{PreparedTableCommit, StagedTableCreate};
 use crate::{
     Catalog, CatalogBuilder, Error, ErrorKind, Namespace, NamespaceIdent, Result,
     SessionCatalog, SessionContext, TableCommit, TableCreation, TableIdent,
@@ -48,6 +50,7 @@ use super::client::{
 };
 use super::endpoint::{
     Endpoint, V1_COMMIT_TRANSACTION, V1_NAMESPACE_EXISTS, V1_TABLE_EXISTS,
+    V1_UPDATE_TABLE,
 };
 use super::request::HttpRequest;
 use super::transaction::PreparedRestCommit;
@@ -478,6 +481,16 @@ struct RestCatalogClient {
 }
 
 impl RestCatalogClient {
+    fn require_endpoint(&self, endpoint: &Endpoint) -> Result<()> {
+        if !self.endpoints.contains(endpoint) {
+            return Err(Error::new(
+                ErrorKind::FeatureUnsupported,
+                format!("REST catalog does not support endpoint {endpoint}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Initializes the runtime config, advertised endpoints, auth manager, and
     /// catalog authentication session shared by one REST catalog instance.
     fn init(
@@ -610,7 +623,36 @@ impl RestCatalog {
         self.inner.prepare_transaction_commit(commits)
     }
 
-    /// Sends a previously prepared REST catalog transaction.
+    /// Builds a single-table REST commit request without sending it.
+    ///
+    /// This is the publication step for a table initialized with
+    /// [`Self::stage_create_table`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the catalog client or request cannot be built.
+    pub fn prepare_table_commit(
+        &self,
+        commit: PreparedTableCommit,
+    ) -> Result<PreparedRestCommit> {
+        self.inner.prepare_table_commit(commit)
+    }
+
+    /// Initializes a table without making it visible in the catalog.
+    ///
+    /// # Errors
+    ///
+    /// Returns catalog, transport, storage-configuration, or metadata errors.
+    pub fn stage_create_table(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> Result<StagedTableCreate> {
+        self.inner
+            .stage_create_table(&self.session_context, namespace, creation)
+    }
+
+    /// Sends a previously prepared REST catalog commit.
     ///
     /// # Errors
     ///
@@ -1202,15 +1244,7 @@ impl SessionCatalog for RestSessionCatalog {
             client
                 .http_client
                 .request(Method::POST, client.config.tables_endpoint(namespace))
-                .json(&CreateTableRequest {
-                    name: creation.name,
-                    location: creation.location,
-                    schema: creation.schema,
-                    partition_spec: creation.partition_spec,
-                    write_order: creation.sort_order,
-                    stage_create: Some(false),
-                    properties: creation.properties,
-                }),
+                .json(&CreateTableRequest::from_table_creation(creation, false)),
         )?;
 
         let http_response = client.query_catalog(context, request)?;
@@ -1488,14 +1522,14 @@ impl SessionCatalog for RestSessionCatalog {
     fn update_table(
         &self,
         context: &SessionContext,
-        mut commit: TableCommit,
+        commit: TableCommit,
     ) -> Result<Table> {
         let client = self.client()?;
         let identifier = commit.identifier().clone();
         let file_io = commit.file_io().clone();
-        let requirements = commit.take_requirements();
-        let updates = commit.take_updates();
-        let location_changed = updates
+        let request_body = CommitTableRequest::from_table_commit(commit);
+        let location_changed = request_body
+            .updates
             .iter()
             .any(|update| matches!(update, crate::TableUpdate::SetLocation { .. }));
 
@@ -1503,11 +1537,7 @@ impl SessionCatalog for RestSessionCatalog {
             client
                 .http_client
                 .request(Method::POST, client.config.table_endpoint(&identifier))
-                .json(&CommitTableRequest {
-                    identifier: Some(identifier.clone()),
-                    requirements,
-                    updates,
-                }),
+                .json(&request_body),
         )?;
 
         let http_response = client.query_catalog(context, request)?;
@@ -1549,6 +1579,23 @@ impl SessionCatalog for RestSessionCatalog {
 }
 
 impl RestSessionCatalog {
+    fn prepare_table_commit(
+        &self,
+        prepared: PreparedTableCommit,
+    ) -> Result<PreparedRestCommit> {
+        let client = self.client()?;
+        client.require_endpoint(&V1_UPDATE_TABLE)?;
+        let (_, commit) = prepared.into_parts();
+        let identifier = commit.identifier().clone();
+        let request = HttpRequest::build(
+            client
+                .http_client
+                .request(Method::POST, client.config.table_endpoint(&identifier))
+                .json(&CommitTableRequest::from_table_commit(commit)),
+        )?;
+        Ok(PreparedRestCommit::new(request, 1))
+    }
+
     fn prepare_transaction_commit(
         &self,
         commits: Vec<PreparedTableCommit>,
@@ -1570,13 +1617,8 @@ impl RestSessionCatalog {
         let table_count = commits.len();
         let mut table_changes = Vec::with_capacity(table_count);
         for prepared in commits {
-            let (_, mut commit) = prepared.into_parts();
-            let identifier = commit.identifier().clone();
-            table_changes.push(CommitTableRequest {
-                identifier: Some(identifier),
-                requirements: commit.take_requirements(),
-                updates: commit.take_updates(),
-            });
+            let (_, commit) = prepared.into_parts();
+            table_changes.push(CommitTableRequest::from_table_commit(commit));
         }
         let request = HttpRequest::build(
             client

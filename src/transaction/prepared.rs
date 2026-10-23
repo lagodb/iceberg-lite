@@ -39,7 +39,13 @@ impl PreparedTransaction {
     }
 }
 
-/// A table commit prepared against one refreshed catalog table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TableCommitKind {
+    Create,
+    Update,
+}
+
+/// A table commit prepared for creation or against a refreshed catalog table.
 ///
 /// Construction remains owned by [`super::Transaction`], so callers cannot
 /// bypass action validation or manufacture requirements and updates directly.
@@ -47,11 +53,24 @@ impl PreparedTransaction {
 pub struct PreparedTableCommit {
     table: Table,
     commit: TableCommit,
+    kind: TableCommitKind,
 }
 
 impl PreparedTableCommit {
     pub(crate) fn new(table: Table, commit: TableCommit) -> Self {
-        Self { table, commit }
+        Self {
+            table,
+            commit,
+            kind: TableCommitKind::Update,
+        }
+    }
+
+    pub(crate) fn new_create(table: Table, commit: TableCommit) -> Self {
+        Self {
+            table,
+            commit,
+            kind: TableCommitKind::Create,
+        }
     }
 
     /// Returns the table identifier targeted by this commit.
@@ -66,5 +85,9 @@ impl PreparedTableCommit {
 
     pub(crate) fn into_parts(self) -> (Table, TableCommit) {
         (self.table, self.commit)
+    }
+
+    pub(crate) fn is_create(&self) -> bool {
+        self.kind == TableCommitKind::Create
     }
 }

@@ -24,7 +24,7 @@ use tempfile::TempDir;
 use crate::io::{LocalStorage, Storage, StorageConfig, StorageFactory};
 use crate::spec::{NestedField, PrimitiveType, Schema, Type};
 use crate::table::Table;
-use crate::transaction::PreparedTableCommit;
+use crate::transaction::{PreparedTableCommit, PreparedTransaction};
 use crate::{
     Catalog, CatalogBuilder, ErrorKind, NamespaceIdent, Result, TableCommit,
     TableCreation, TableIdent, TableUpdate,
@@ -246,6 +246,46 @@ fn stale_prepared_pointer_does_not_overwrite_another_connection() {
 }
 
 #[test]
+fn staged_create_does_not_publish_after_namespace_is_dropped() {
+    let fixture = Fixture::new();
+    let schema = Schema::builder()
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long))
+                .into(),
+        ])
+        .build()
+        .unwrap();
+    let staged = fixture
+        .catalog
+        .stage_create_table(
+            &fixture.namespace,
+            TableCreation::builder()
+                .name("events".to_owned())
+                .schema(schema)
+                .build(),
+        )
+        .unwrap();
+    let identifier = staged.table().identifier().clone();
+    let PreparedTransaction::Commit(commit) =
+        staged.transaction().prepare(&fixture.catalog).unwrap()
+    else {
+        panic!("staged create must produce a catalog commit");
+    };
+    let prepared = fixture
+        .catalog
+        .prepare_transaction_commit(vec![commit])
+        .unwrap();
+
+    fixture.catalog.drop_namespace(&fixture.namespace).unwrap();
+
+    assert_eq!(
+        prepared.publish().unwrap_err().kind(),
+        ErrorKind::NamespaceNotFound
+    );
+    assert!(!fixture.catalog.table_exists(&identifier).unwrap());
+}
+
+#[test]
 fn later_table_conflict_rolls_back_all_pointer_updates() {
     let fixture = Fixture::new();
     let first = fixture.table("first");
@@ -361,3 +401,4 @@ fn locked_database_returns_an_error_without_publishing() {
 }
 
 mod contract;
+mod transaction;

@@ -22,10 +22,12 @@ use std::collections::HashMap;
 use http::StatusCode;
 use serde_derive::{Deserialize, Serialize};
 
-use crate::spec::{Schema, SortOrder, TableMetadata, UnboundPartitionSpec};
+use crate::spec::{
+    Schema, SortOrder, TableMetadata, TableProperties, UnboundPartitionSpec,
+};
 use crate::{
-    Error, ErrorKind, Namespace, NamespaceIdent, TableIdent, TableRequirement,
-    TableUpdate,
+    Error, ErrorKind, Namespace, NamespaceIdent, TableCommit, TableCreation,
+    TableIdent, TableRequirement, TableUpdate,
 };
 
 pub use crate::io::StorageCredential;
@@ -414,6 +416,36 @@ pub struct CreateTableRequest {
     pub properties: HashMap<String, String>,
 }
 
+impl CreateTableRequest {
+    pub(super) fn from_table_creation(
+        creation: TableCreation,
+        stage_create: bool,
+    ) -> Self {
+        let TableCreation {
+            name,
+            location,
+            schema,
+            partition_spec,
+            sort_order,
+            mut properties,
+            format_version,
+        } = creation;
+        properties.insert(
+            TableProperties::PROPERTY_FORMAT_VERSION.to_owned(),
+            (format_version as u8).to_string(),
+        );
+        Self {
+            name,
+            location,
+            schema,
+            partition_spec,
+            write_order: sort_order,
+            stage_create: Some(stage_create),
+            properties,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 /// Request to commit updates to a table.
 ///
@@ -432,6 +464,16 @@ pub struct CommitTableRequest {
     pub requirements: Vec<TableRequirement>,
     /// List of updates to apply to the table metadata
     pub updates: Vec<TableUpdate>,
+}
+
+impl CommitTableRequest {
+    pub(super) fn from_table_commit(mut commit: TableCommit) -> Self {
+        Self {
+            identifier: Some(commit.identifier().clone()),
+            requirements: commit.take_requirements(),
+            updates: commit.take_updates(),
+        }
+    }
 }
 
 /// Request to atomically commit changes to multiple tables in one REST catalog.

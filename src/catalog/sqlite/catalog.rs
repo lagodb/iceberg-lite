@@ -18,7 +18,7 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, params};
+use rusqlite::{Connection, OptionalExtension, Result as SqliteResult, ffi, params};
 
 use crate::catalog::MetadataLocation;
 use crate::catalog::utils::drop_table_data;
@@ -26,6 +26,7 @@ use crate::encryption::kms::KeyManagementClient;
 use crate::io::FileIO;
 use crate::spec::{TableMetadata, TableMetadataBuilder};
 use crate::table::Table;
+use crate::transaction::StagedTableCreate;
 use crate::{
     Catalog, Error, ErrorKind, Namespace, NamespaceIdent, Result, TableCommit,
     TableCreation, TableIdent,
@@ -127,7 +128,7 @@ impl SqliteCatalog {
         )?)
     }
 
-    fn require_namespace(
+    pub(super) fn require_namespace(
         &self,
         connection: &Connection,
         namespace: &str,
@@ -158,13 +159,92 @@ impl SqliteCatalog {
         builder.build()
     }
 
-    fn insert_table(&self, identifier: &TableIdent, location: &str) -> Result<()> {
-        let namespace = Self::namespace_key(identifier.namespace())?;
-        self.connection()?.execute(
-            "INSERT INTO iceberg_tables (catalog_name, table_namespace, table_name, metadata_location, iceberg_type)
-             VALUES (?1, ?2, ?3, ?4, 'TABLE')",
-            params![self.inner.name, namespace, identifier.name(), location],
-        )?;
+    fn build_staged_table(
+        &self,
+        identifier: TableIdent,
+        metadata: TableMetadata,
+    ) -> Result<Table> {
+        let mut builder = Table::builder()
+            .identifier(identifier)
+            .metadata(metadata)
+            .file_io(self.inner.file_io.clone());
+        if let Some(client) = &self.inner.kms_client {
+            builder = builder.kms_client(Arc::clone(client));
+        }
+        builder.build()
+    }
+
+    fn prepare_table_creation(
+        &self,
+        namespace: &NamespaceIdent,
+        mut creation: TableCreation,
+    ) -> Result<(TableIdent, TableMetadata)> {
+        let namespace_info = self.get_namespace(namespace)?;
+        let identifier = TableIdent::new(namespace.clone(), creation.name.clone());
+        self.ensure_table_absent(&identifier)?;
+        if creation.location.is_none() {
+            let base = match namespace_info.properties().get("location") {
+                Some(location) => location.clone(),
+                None => {
+                    if self.inner.warehouse.is_empty() {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Table creation requires a location or warehouse",
+                        ));
+                    }
+                    format!("{}/{}", self.inner.warehouse, namespace.join("/"))
+                }
+            };
+            creation.location = Some(format!("{base}/{}", identifier.name()));
+        }
+        let metadata = TableMetadataBuilder::from_table_creation(creation)?
+            .build()?
+            .metadata;
+        Ok((identifier, metadata))
+    }
+
+    /// Initializes a table without inserting its catalog pointer.
+    ///
+    /// # Errors
+    ///
+    /// Returns namespace, duplicate-table, location, or metadata errors.
+    pub fn stage_create_table(
+        &self,
+        namespace: &NamespaceIdent,
+        creation: TableCreation,
+    ) -> Result<StagedTableCreate> {
+        let (identifier, metadata) =
+            self.prepare_table_creation(namespace, creation)?;
+        let table = self.build_staged_table(identifier, metadata)?;
+        Ok(StagedTableCreate::new(table))
+    }
+
+    pub(super) fn insert_table(
+        &self,
+        connection: &Connection,
+        namespace: &str,
+        identifier: &TableIdent,
+        location: &str,
+    ) -> Result<()> {
+        connection
+            .execute(
+                "INSERT INTO iceberg_tables (catalog_name, table_namespace, table_name, metadata_location, iceberg_type)
+                 VALUES (?1, ?2, ?3, ?4, 'TABLE')",
+                params![self.inner.name, namespace, identifier.name(), location],
+            )
+            .map_err(|error| {
+                if error.sqlite_extended_error_code()
+                    == Some(ffi::SQLITE_CONSTRAINT_PRIMARYKEY)
+                {
+                    Error::new(
+                        ErrorKind::TableAlreadyExists,
+                        format!("Table {identifier} already exists"),
+                    )
+                    .with_source(error)
+                } else {
+                    error.into()
+                }
+            })?;
         Ok(())
     }
 
@@ -385,29 +465,10 @@ impl Catalog for SqliteCatalog {
     fn create_table(
         &self,
         namespace: &NamespaceIdent,
-        mut creation: TableCreation,
+        creation: TableCreation,
     ) -> Result<Table> {
-        let namespace_info = self.get_namespace(namespace)?;
-        let identifier = TableIdent::new(namespace.clone(), creation.name.clone());
-        self.ensure_table_absent(&identifier)?;
-        if creation.location.is_none() {
-            let base = match namespace_info.properties().get("location") {
-                Some(location) => location.clone(),
-                None => {
-                    if self.inner.warehouse.is_empty() {
-                        return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            "Table creation requires a location or warehouse",
-                        ));
-                    }
-                    format!("{}/{}", self.inner.warehouse, namespace.join("/"))
-                }
-            };
-            creation.location = Some(format!("{base}/{}", identifier.name()));
-        }
-        let metadata = TableMetadataBuilder::from_table_creation(creation)?
-            .build()?
-            .metadata;
+        let (identifier, metadata) =
+            self.prepare_table_creation(namespace, creation)?;
         let location =
             MetadataLocation::try_new_with_metadata(&metadata)?.to_string();
         metadata.write_to(&self.inner.file_io, &location)?;
@@ -421,7 +482,11 @@ impl Catalog for SqliteCatalog {
         // on 2026-10-14; no matching fix PR was found in the upstream search.
         // Reference implementation:
         // https://github.com/apache/iceberg-rust/blob/bb1e4a4861f02377489eff818b75138f414c4cb0/crates/catalog/sql/src/catalog.rs#L1069-L1168
-        self.insert_table(&identifier, &location)?;
+        let namespace = Self::namespace_key(identifier.namespace())?;
+        {
+            let connection = self.connection()?;
+            self.insert_table(&connection, &namespace, &identifier, &location)?;
+        }
         self.build_table(identifier, location, metadata)
     }
 
@@ -435,7 +500,16 @@ impl Catalog for SqliteCatalog {
             TableMetadata::read_from(&self.inner.file_io, &metadata_location)?;
         // Same known insert-before-build limitation as create_table above;
         // retain this ordering pending the upstream fix described there.
-        self.insert_table(identifier, &metadata_location)?;
+        let namespace = Self::namespace_key(identifier.namespace())?;
+        {
+            let connection = self.connection()?;
+            self.insert_table(
+                &connection,
+                &namespace,
+                identifier,
+                &metadata_location,
+            )?;
+        }
         self.build_table(identifier.clone(), metadata_location, metadata)
     }
 
