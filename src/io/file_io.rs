@@ -47,6 +47,34 @@ pub trait Storage: Send + Sync + std::fmt::Debug {
         Ok(())
     }
 
+    /// Delete one file from a cleanup path that must not wait without bound,
+    /// such as a host transaction-end callback.
+    ///
+    /// Storage that can bound the request by a deadline overrides this. The
+    /// default rejects the request rather than falling back to [`Self::delete`],
+    /// whose remote request may wait or reconnect indefinitely.
+    fn delete_cleanup(&self, _path: &str) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!(
+                "{} storage does not support bounded cleanup deletion",
+                self.scheme()
+            ),
+        ))
+    }
+
+    /// Remove a directory and all its contents from a cleanup path that must
+    /// not wait without bound. See [`Self::delete_cleanup`].
+    fn remove_dir_all_cleanup(&self, _path: &str) -> Result<()> {
+        Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            format!(
+                "{} storage does not support bounded cleanup directory removal",
+                self.scheme()
+            ),
+        ))
+    }
+
     /// Determine the path slice passed to this storage's file operations.
     ///
     /// Returns the byte offset into `uri` where that path begins. Storage bound
@@ -176,6 +204,22 @@ impl FileIO {
         let path_str = path.as_ref();
         let relative_path_pos = self.storage.resolve_uri(path_str)?;
         self.storage.remove_dir_all(&path_str[relative_path_pos..])
+    }
+
+    /// Delete a file from a cleanup path; see [`Storage::delete_cleanup`].
+    pub fn delete_cleanup(&self, path: impl AsRef<str>) -> Result<()> {
+        let path_str = path.as_ref();
+        let relative_path_pos = self.storage.resolve_uri(path_str)?;
+        self.storage.delete_cleanup(&path_str[relative_path_pos..])
+    }
+
+    /// Remove a directory from a cleanup path; see
+    /// [`Storage::remove_dir_all_cleanup`].
+    pub fn remove_dir_all_cleanup(&self, path: impl AsRef<str>) -> Result<()> {
+        let path_str = path.as_ref();
+        let relative_path_pos = self.storage.resolve_uri(path_str)?;
+        self.storage
+            .remove_dir_all_cleanup(&path_str[relative_path_pos..])
     }
 
     /// Get the underlying storage implementation.
