@@ -30,6 +30,7 @@ pub(crate) mod _serde {
 
     use crate::Error;
     use crate::error::invalid_data;
+    use crate::spec::values::decimal_utils::i128_from_be_bytes;
     use crate::spec::values::{Literal, Map, PrimitiveLiteral, Struct};
     use crate::spec::{
         MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME, PrimitiveType, StructType, Type,
@@ -603,38 +604,42 @@ pub(crate) mod _serde {
                         }
                     }
                     Type::Primitive(PrimitiveType::Decimal { precision, .. }) => {
+                        // Two producers write decimal bytes: Avro stores
+                        // fixed(required_bytes), and this module's encoder
+                        // writes the full i128, which byte-preserving formats
+                        // such as CBOR return here. Other widths have no
+                        // producer and stay rejected.
                         let required_bytes =
                             Type::decimal_required_bytes(*precision)? as usize;
-
-                        if v.len() == required_bytes {
-                            // Pad the bytes to 16 bytes (i128 size) with sign extension
-                            let mut padded_bytes = [0u8; 16];
-                            let start_idx = 16 - v.len();
-
-                            // Copy the input bytes to the end of the array
-                            padded_bytes[start_idx..].copy_from_slice(&v);
-
-                            // Sign extend if the number is negative (MSB is 1)
-                            if !v.is_empty() && (v[0] & 0x80) != 0 {
-                                // Fill the padding with 0xFF for negative numbers
-                                for byte in &mut padded_bytes[..start_idx] {
-                                    *byte = 0xFF;
-                                }
+                        let encoder_bytes = size_of::<i128>();
+                        match i128_from_be_bytes(&v) {
+                            Some(unscaled)
+                                if v.len() == required_bytes
+                                    || v.len() == encoder_bytes =>
+                            {
+                                Ok(Some(Literal::decimal(unscaled)))
                             }
-
-                            Ok(Some(Literal::Primitive(PrimitiveLiteral::Int128(
-                                i128::from_be_bytes(padded_bytes),
-                            ))))
-                        } else {
-                            Err(invalid_err_with_reason(
+                            _ if required_bytes == encoder_bytes => {
+                                Err(invalid_err_with_reason(
+                                    "bytes",
+                                    &format!(
+                                        "Decimal with precision {} must be exactly {} bytes, got {}",
+                                        precision,
+                                        required_bytes,
+                                        v.len()
+                                    ),
+                                ))
+                            }
+                            _ => Err(invalid_err_with_reason(
                                 "bytes",
                                 &format!(
-                                    "Decimal with precision {} must be exactly {} bytes, got {}",
+                                    "Decimal with precision {} must be {} or {} bytes, got {}",
                                     precision,
                                     required_bytes,
+                                    encoder_bytes,
                                     v.len()
                                 ),
-                            ))
+                            )),
                         }
                     }
                     _ => Err(invalid_err("bytes")),

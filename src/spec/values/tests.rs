@@ -19,8 +19,8 @@
 
 use std::collections::HashSet;
 
-use apache_avro::to_value;
 use apache_avro::types::Value;
+use apache_avro::{from_value, to_value};
 use ordered_float::OrderedFloat;
 use serde_bytes::ByteBuf;
 use serde_json::Value as JsonValue;
@@ -816,6 +816,39 @@ fn test_raw_literal_bytes_decimal_wrong_length_too_few() {
             scale: 2,
         }),
     );
+}
+
+#[test]
+fn test_datum_decimal_serde_round_trip_preserving_bytes() {
+    // Avro values, like CBOR, keep byte strings distinct from sequences, so the
+    // encoder's 16-byte decimal returns through the Bytes branch, not the List
+    // branch that JSON reaches.
+    let cases: [(i128, u32, u32); 10] = [
+        (7, 1, 0),
+        (-7, 1, 0),
+        (123_456_789, 9, 2),
+        (-123_456_789, 9, 2),
+        (2_400, 15, 2),
+        (-999_999_999_999_999, 15, 2),
+        (999_999_999_999_999_999, 18, 4),
+        (-1, 18, 4),
+        (99_999_999_999_999_999_999_999_999_999_999_999_999, 38, 10),
+        (-99_999_999_999_999_999_999_999_999_999_999_999_999, 38, 10),
+    ];
+    for (unscaled, precision, scale) in cases {
+        let datum = Datum::decimal_from_unscaled(unscaled, precision, scale).unwrap();
+        let value = to_value(&datum).unwrap();
+        let Value::Record(fields) = &value else {
+            panic!("Datum must serialize as a record, got {value:?}");
+        };
+        assert!(
+            fields.iter().any(|(name, literal)| name == "literal"
+                && matches!(literal, Value::Bytes(bytes) if bytes.len() == 16)),
+            "decimal({precision}, {scale}) literal must be encoded as 16 bytes: {value:?}"
+        );
+        let decoded: Datum = from_value(&value).unwrap();
+        assert_eq!(decoded, datum);
+    }
 }
 
 #[test]
